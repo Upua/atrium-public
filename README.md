@@ -1,6 +1,6 @@
 # atrium
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg) ![Status: artifact](https://img.shields.io/badge/status-artifact-orange.svg) ![Last verified](https://img.shields.io/badge/last%20verified-2026--04--25-brightgreen.svg) ![Companion: captain-meridian-stack](https://img.shields.io/badge/companion-captain--meridian--stack--public-lightgrey.svg)
+![License: Apache 2.0 + CC BY-NC-SA 4.0](https://img.shields.io/badge/license-Apache%202.0%20%2B%20CC%20BY--NC--SA%204.0-blue.svg) ![Status: artifact](https://img.shields.io/badge/status-artifact-orange.svg) ![Last verified](https://img.shields.io/badge/last%20verified-2026--04--25-brightgreen.svg) ![Companion: captain-meridian-stack](https://img.shields.io/badge/companion-captain--meridian--stack--public-lightgrey.svg)
 
 Workspace primitives for treating Claude as a co-inhabitant, not a tool.
 
@@ -73,9 +73,14 @@ If those boundaries don't work for you, that's fine — read the patterns, build
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Dual-licensed by file type:
 
-The code is permissive; the philosophy doesn't transfer by copying. You'll have to live with your own version a while before it becomes yours.
+- **Code** (`bin/*`, `lib/*.py`, `kitty/*`, `zellij/*`, `design/*.css`, `design/*.html`) — **Apache License 2.0**. See [LICENSE](LICENSE). Permissive, with explicit patent grant.
+- **Writing** (`AGENTS.md`, `PRINCIPLES.md`, `PATTERNS.md`, `README.md`, `brain/*.md`, `design/DESIGN-SYSTEM.md`) — **Creative Commons BY-NC-SA 4.0**. See [LICENSE-CONTENT](LICENSE-CONTENT). Adapt freely for non-commercial use, attribute, share-alike.
+
+See [NOTICE](NOTICE) for the file-type breakdown, the embedded-code-block rule, and the (non-binding) preference statement on AI training data.
+
+The code is permissive; the writing has guardrails against commercial repackaging. The philosophy doesn't transfer by copying — you'll have to live with your own version a while before it becomes yours.
 
 ## Companion repo
 

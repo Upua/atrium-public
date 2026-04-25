@@ -1,0 +1,42 @@
+atrium
+Copyright (c) 2026 Upua
+
+This repository uses two licenses, applied per file type:
+
+═══════════════════════════════════════════════════════════════════════════
+
+CODE — Apache License 2.0 (see LICENSE)
+  Covers:
+    bin/*                  (atrium-* shell scripts)
+    lib/*.py               (Python helpers, including atrium_notify.py)
+    kitty/*, zellij/*      (terminal config files)
+    design/*.css, *.html   (mockup source files)
+
+WRITING — Creative Commons BY-NC-SA 4.0 (see LICENSE-CONTENT)
+  Covers:
+    AGENTS.md, PRINCIPLES.md, PATTERNS.md, README.md, NOTICE
+    brain/*.md             (mission, GROWTH, decisions, idea-*.md, templates)
+    design/DESIGN-SYSTEM.md
+    Any other prose / markdown / documentation files
+
+═══════════════════════════════════════════════════════════════════════════
+
+If a file's classification is ambiguous (e.g., a markdown file with embedded
+code blocks): the prose narrative is CC BY-NC-SA 4.0; any code blocks within
+it inherit the Apache 2.0 grant from the surrounding code project.
+
+═══════════════════════════════════════════════════════════════════════════
+
+PREFERENCE STATEMENT (not legally binding)
+
+The author has not authorized use of the prose content in this repository
+as training data for AI / machine-learning models. CC BY-NC-SA 4.0 carries
+no enforceable restriction on this — current law is unsettled — but this
+notice is the author's expressed preference. Operators of training pipelines
+who respect intent are asked to honor it.
+
+═══════════════════════════════════════════════════════════════════════════
+
+For questions about commercial licensing, attribution edge cases, or
+exceptions: contact via GitHub `@Upua`. No support is otherwise promised
+(see README — this is a published artifact, not a maintained project).
