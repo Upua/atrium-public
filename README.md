@@ -71,6 +71,13 @@ If those boundaries don't work for you, that's fine — read the patterns, build
 
 **If this inspired you, build your own version and link it back.** A network of personal-AI-infrastructure attempts beats one canonical fork — different operators will solve different parts well.
 
+## What's stubbed
+
+Two pieces are present but not fully wired:
+
+- `atrium-notify --modality voice` is stubbed — it logs "voice route requested but not yet implemented" and exits 0. Voice wiring (Kokoro/voicemode RPC) is Phase 2.2b in the [ROADMAP](https://github.com/Upua/captain-meridian-stack-public/blob/main/ROADMAP.md).
+- The `state/`, `snapshots/`, and `peers/` runtime directories from the dev repo are intentionally NOT included — they hold ephemeral session state and would re-pollute on first run anyway.
+
 ## License
 
 Dual-licensed by file type:
