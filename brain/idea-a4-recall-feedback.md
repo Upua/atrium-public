@@ -4,6 +4,23 @@
 **Status:** in flight
 **Tail:** `~/Atrium/brain/idea-a4-recall-feedback.md`
 
+## Loop at a glance
+
+```mermaid
+flowchart TD
+    A[memory-surface fires on UserPromptSubmit]
+    B[query embed-daemon for top hits]
+    C[Look up usefulness multiplier per source from recall-feedback DB]
+    D[Re-rank hits by raw_score x multiplier]
+    E[Inject top results into Claude context]
+    F[Claude responds]
+    G[recall-detector fires on Stop]
+    H[Trigram overlap: did response use the surface?]
+    I[Update score: useful++ or ignored++]
+    A --> B --> C --> D --> E --> F --> G --> H --> I
+    I -.->|next prompt| C
+```
+
 ## Goal
 
 Close the recall loop. Right now memory-surface.sh surfaces ChromaDB + Cortex hits on every substantive prompt, but we never learn which ones were actually useful. A.4 adds observability (log surfaces), detection (fuzzy-match cited content in response), scoring (Bayesian-smoothed useful/ignored ratio), and application (rerank future surfaces by learned usefulness).

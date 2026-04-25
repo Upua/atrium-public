@@ -7,11 +7,15 @@ Workspace primitives for treating Claude as a co-inhabitant, not a tool.
 > **This is a published artifact, not a maintained project.**
 > **Last verified:** 2026-04-25.
 
+> **If you arrived here cold:** read [`captain-meridian-stack-public`](https://github.com/Upua/captain-meridian-stack-public) first — it has the philosophy (`LANDSCAPE.md`, `ARCHITECTURE.md`, `ROADMAP.md`) that makes the code in this repo legible. Without that context, this repo will read as a pile of cognitive-verb shell scripts.
+
 ---
 
 ## What this is
 
 Working code from one person's daily-driver personal AI infrastructure. About thirty `atrium-*` shell verbs (cognitive primitives), a small Python lib (`lib/atrium_notify.py` and helpers), philosophy docs (`AGENTS.md`, `PRINCIPLES.md`, `PATTERNS.md`), and the brain corpus (`brain/decisions/`, `brain/idea-*.md`, templates) that explains the patterns.
+
+**About `brain/`:** durable agent memory for the workspace. What lives here: design docs (`idea-*.md`), decision records (`decisions/`), templates for task/handoff/implementation-plan, the build narrative (`GROWTH.md`), the system mission. What does *not* live here: live working state (handoffs from real sessions, current task, walkthrough) and runtime state (peer heartbeats, traces, embedding previews) — those live in the private dev repo this artifact was extracted from.
 
 This is the workspace half. The narrative + roadmap + competitive landscape live in [`captain-meridian-stack`](https://github.com/Upua/captain-meridian-stack-public).
 
@@ -21,6 +25,31 @@ This is the workspace half. The narrative + roadmap + competitive landscape live
 - A maintained project with issues, PRs, and a roadmap driven by users
 - Multi-provider, portable, generalized, or production-hardened
 - Useful as-is on your machine without significant adaptation
+
+## The peer model at a glance
+
+```mermaid
+flowchart LR
+    subgraph Peers
+        Claude[claude<br>orchestrator heartbeat]
+        DMN[dmn<br>trajectory advisor]
+        Sonnet[sonnet<br>execution dispatch]
+        Mascot[mascot<br>ambient surface]
+        EmbedDaemon[embed-daemon<br>warm MiniLM]
+        Cortex[cortex<br>system awareness]
+        Archivist[archivist<br>Haiku learner]
+    end
+    Coord[Flat-file coordination<br>peers/name/heartbeat<br>peers/name/outbox.jsonl<br>peers/name/status.md<br>peers/name/identity.md]
+    Claude --- Coord
+    DMN --- Coord
+    Sonnet --- Coord
+    Mascot --- Coord
+    EmbedDaemon --- Coord
+    Cortex --- Coord
+    Archivist --- Coord
+```
+
+Peers don't talk over an API. They write files. The orchestrator (a Claude session) drains outboxes, reads heartbeats, and addresses peers by directory name. Adding a peer is creating a directory.
 
 ## How to read this repo
 
@@ -39,6 +68,8 @@ If you want to understand the system, read the philosophy first and the code sec
 - **No promises about updates.** This is a snapshot. If the "Last verified" date in this README is six months stale when you find it, the patterns are still here, but the live system has moved on.
 
 If those boundaries don't work for you, that's fine — read the patterns, build your own version with your own stack.
+
+**If this inspired you, build your own version and link it back.** A network of personal-AI-infrastructure attempts beats one canonical fork — different operators will solve different parts well.
 
 ## License
 

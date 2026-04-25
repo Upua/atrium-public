@@ -4,6 +4,26 @@
 **Status:** in flight
 **Tail path:** `~/Atrium/brain/idea-b-dmn-peer.md`
 
+## Flow at a glance
+
+```mermaid
+sequenceDiagram
+    participant DMN as DMN daemon (cron)
+    participant Outbox as peers/dmn/outbox.jsonl
+    participant Dedup as dmn-advisories.json
+    participant SB as atrium-session-begin
+    participant Orch as Orchestrator (Claude)
+
+    DMN->>DMN: read 7-day ctx (sessions, errors, FRAGILE breadcrumbs, projects)
+    DMN->>DMN: run 4 heuristics (error_spike, session_drift, fragile_debt, project_sprawl)
+    DMN->>Dedup: check 7-day window
+    DMN->>Outbox: write up to 3 advisories
+    Note over DMN,Outbox: severity: info / notice / hmm
+    SB->>Outbox: drain on session start
+    SB->>Orch: render advisories inline
+    Orch->>Orch: act on advisory or note context
+```
+
 ## Goal
 Turn the DMN daemon from a write-only self-model generator into a **peer** that can surface advisory messages to the orchestrator. Closes the loop: DMN already sees the trajectory (session counts, error rates, fragile debt, project sprawl) but its output is read only at session-start via the embodied-startup script. B makes it proactive — "the previous instance noticed X, you should know".
 
