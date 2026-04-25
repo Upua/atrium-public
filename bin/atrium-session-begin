@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# atrium-session-begin — a single entry point that bootstraps an Atrium
+# working session cleanly. Per Sonnet's v0.3 feedback: the handoff checklist
+# was prose; this is the executable version.
+#
+# Does in order:
+#   1. Sync real cost from Claude Code transcripts (atrium-cost-ingest scan)
+#   2. Sweep stale peers (any heartbeat > 1h old is unregistered)
+#   3. Suggest-or-set a realistic daily budget (median of last 7 days)
+#   4. Ensure claude-as-peer self is live + in roster
+#   5. Print the current handoff packet + HUD line so the agent lands oriented
+#
+# Intended to be called at the start of every Claude Code session inside
+# Atrium (also wireable to SessionStart hook). Idempotent — running twice is
+# fine.
+#
+# Usage:
+#   atrium-session-begin                 # full sequence
+#   atrium-session-begin --quiet         # suppress the handoff printout
+#   atrium-session-begin --no-budget-adjust  # skip the budget suggestion
+#   atrium-session-begin --reason "<why>"    # for trace event
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+QUIET=0
+NO_BUDGET=0
+REASON="session-begin"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quiet) QUIET=1; shift ;;
+    --no-budget-adjust) NO_BUDGET=1; shift ;;
+    --reason) REASON="$2"; shift 2 ;;
+    --help|-h) sed -n '2,18p' "$0"; exit 0 ;;
+    *) echo "atrium-session-begin: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+_say() { [[ "$QUIET" -eq 1 ]] || echo "$@"; }
+
+_say "⌖ atrium-session-begin — bootstrapping"
+
+# 1. Cost ingest (one-shot scan + ensure watcher daemon is running so new
+# tool events pick up cost_usd live — without the watcher, HUD silently
+# drifts to "today $0" over time despite real spend. Pre-v0.6 audit found
+# the watcher had been stopped for ~1 day, producing a 252-event blind spot.)
+_say "  [1/5] ingest cost from Claude transcripts"
+"$ATRIUM_ROOT/bin/atrium-cost-ingest" scan 2>&1 | sed 's/^/    /' | ( [[ "$QUIET" -eq 1 ]] && cat >/dev/null || cat )
+if ! "$ATRIUM_ROOT/bin/atrium-daemon" status cost-ingest-watcher >/dev/null 2>&1; then
+  _say "        cost-ingest-watcher stopped — restarting"
+  "$ATRIUM_ROOT/bin/atrium-daemon" start cost-ingest-watcher -- \
+    "$ATRIUM_ROOT/bin/atrium-cost-ingest" watch >/dev/null 2>&1 || true
+fi
+
+# 2. Sweep stale peers (>1h)
+_say "  [2/5] sweep peers stale >1h"
+STALE_COUNT=$(python3 - "$ATRIUM_ROOT" <<'PY'
+import sys, os, json, datetime
+from pathlib import Path
+
+root = Path(sys.argv[1]) / "peers"
+now = datetime.datetime.now().astimezone()
+stale = []
+if root.exists():
+    for d in sorted(root.iterdir()):
+        if not d.is_dir(): continue
+        hb = d / "heartbeat.json"
+        if not hb.exists(): continue
+        try: data = json.loads(hb.read_text())
+        except: continue
+        ts = data.get("ts", "")
+        try:
+            t = datetime.datetime.fromisoformat(ts.replace("Z","+00:00"))
+        except Exception:
+            continue
+        if (now - t).total_seconds() > 3600:
+            stale.append(d.name)
+print(len(stale))
+for n in stale: print(n)
+PY
+)
+N_STALE=$(echo "$STALE_COUNT" | head -1)
+if [[ "$N_STALE" -gt 0 ]]; then
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    "$ATRIUM_ROOT/bin/atrium-peer" unregister "$name" >/dev/null 2>&1 || true
+    _say "    unregistered stale: $name"
+  done < <(echo "$STALE_COUNT" | tail -n +2)
+else
+  _say "    (none)"
+fi
+
+# 3. Suggest / set realistic budget
+if [[ "$NO_BUDGET" -eq 0 ]]; then
+  _say "  [3/5] budget sanity"
+  SUG=$(python3 - "$ATRIUM_ROOT" <<'PY'
+import sys, os, json, datetime
+from pathlib import Path
+from collections import defaultdict
+
+root = Path(sys.argv[1])
+trace = root / "state/trace.jsonl"
+budget_f = root / "state/budget.json"
+if not trace.exists():
+    print("0"); sys.exit()
+
+# per-day cost over last 7 days
+today = datetime.date.today()
+daily = defaultdict(float)
+with trace.open() as f:
+    for ln in f:
+        try: d = json.loads(ln)
+        except: continue
+        c = d.get("cost_usd")
+        if not isinstance(c, (int, float)): continue
+        ts = d.get("ts","")[:10]
+        try:
+            dt = datetime.date.fromisoformat(ts)
+        except:
+            continue
+        if 0 <= (today - dt).days <= 7:
+            daily[ts] += c
+
+if not daily:
+    print("10")
+    sys.exit()
+
+# median of last 7 days
+vals = sorted(daily.values())
+med = vals[len(vals)//2]
+# round up to nearest $5 and add 50% headroom
+target = max(10, int((med * 1.5 + 4.99) // 5) * 5)
+cur = 10.0
+if budget_f.exists():
+    try: cur = float(json.loads(budget_f.read_text()).get("daily_usd", 10))
+    except: pass
+print(f"{cur:.0f}:{target}:{med:.2f}")
+PY
+)
+  IFS=: read -r CUR TARGET MED <<<"$SUG"
+  if [[ "${TARGET:-0}" -gt "${CUR:-0}" ]]; then
+    _say "    current \$${CUR}/day · 7-day median \$${MED} · suggesting \$${TARGET}"
+    "$ATRIUM_ROOT/bin/atrium-guard" set-budget "$TARGET" >/dev/null 2>&1 || true
+    _say "    set to \$${TARGET}"
+  else
+    _say "    current \$${CUR} covers 7-day median \$${MED} — no change"
+  fi
+fi
+
+# 3b. Warm-nvim — spawn if not running so atrium-edit never cold-starts
+_say "  [3b] warm nvim peer"
+if ! "$ATRIUM_ROOT/bin/atrium-nvim" sock >/dev/null 2>&1 || [[ ! -S "$("$ATRIUM_ROOT/bin/atrium-nvim" sock 2>/dev/null)" ]]; then
+  "$ATRIUM_ROOT/bin/atrium-nvim" spawn >/dev/null 2>&1 && _say "    warm" || _say "    (spawn failed)"
+else
+  _say "    (already warm)"
+fi
+
+# 3c. Warm embed-daemon — MiniLM holds semantic search at <100ms for hooks
+_say "  [3c] warm embed-daemon"
+if "$ATRIUM_ROOT/bin/atrium-daemon" status embed-daemon 2>/dev/null | /usr/bin/grep -q "running"; then
+  _say "    (already running)"
+else
+  "$ATRIUM_ROOT/bin/atrium-daemon" start embed-daemon -- \
+    "$ATRIUM_ROOT/bin/atrium-embed-daemon" >/dev/null 2>&1 && _say "    started (cold-load ~8s in background)" || _say "    (start failed)"
+fi
+
+# 4. Self-peer alive
+_say "  [4/5] register claude-as-peer"
+if "$ATRIUM_ROOT/bin/atrium-self" is-running 2>/dev/null; then
+  "$ATRIUM_ROOT/bin/atrium-self" status "session-begin · $(date +%H:%M)" >/dev/null
+  _say "    (already running — status refreshed)"
+else
+  "$ATRIUM_ROOT/bin/atrium-self" start "session-begin · $(date +%H:%M)" 2>&1 | sed 's/^/    /' | ( [[ "$QUIET" -eq 1 ]] && cat >/dev/null || cat )
+fi
+
+# 5. Print handoff + HUD
+_say "  [5/5] orient: handoff + HUD"
+if [[ "$QUIET" -eq 0 ]]; then
+  if [[ -f "$ATRIUM_ROOT/brain/handoff.md" ]]; then
+    echo ""
+    echo "--- last handoff ($ATRIUM_ROOT/brain/handoff.md) ---"
+    head -30 "$ATRIUM_ROOT/brain/handoff.md" | sed 's/^/  /'
+    echo "  ..."
+    echo "  (full: atrium-handoff show)"
+  fi
+  echo ""
+  echo "--- HUD ---"
+  "$ATRIUM_ROOT/bin/atrium-hud" 2>/dev/null | sed 's/^/  /'
+fi
+
+# 6. Embed-scan: catch any new high-signal content since last scan (async, non-blocking)
+if [[ -x "$ATRIUM_ROOT/bin/atrium-embed-source" ]]; then
+  ( "$ATRIUM_ROOT/bin/atrium-embed-source" scan-all \
+    >> "$HOME/.claude/cache/atrium-embed-scan.log" 2>&1 ) &
+fi
+
+# 7. DMN advisories — drain anything the Default Mode Network noticed since
+# last session and surface it. Outbox is append-only from dmn-daemon; `recv`
+# truncates after read, so advisories display exactly once.
+DMN_OUTBOX="$ATRIUM_ROOT/peers/dmn/outbox.jsonl"
+if [[ -s "$DMN_OUTBOX" ]]; then
+  DMN_ADVISORIES=$("$ATRIUM_ROOT/bin/atrium-peer" recv dmn 2>/dev/null || true)
+  if [[ -n "$DMN_ADVISORIES" ]] && [[ "$QUIET" -eq 0 ]]; then
+    echo ""
+    echo "--- DMN advisories ---"
+    echo "$DMN_ADVISORIES" | python3 -c "
+import sys, json
+icons = {'hmm': '⚠', 'notice': 'ℹ', 'info': '·'}
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    icon = icons.get(d.get('severity', 'info'), '·')
+    print(f\"  {icon} [{d.get('kind','?')}] {d.get('message','')}\")
+"
+  fi
+fi
+
+"$ATRIUM_ROOT/bin/atrium-trace" session_begin reason="$REASON" >/dev/null 2>&1 || true
+_say ""
+_say "⌖ atrium ready · $(date +%H:%M:%S)"

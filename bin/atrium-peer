@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# atrium-peer — flat-file peer coordination for Atrium.
+#
+# Each peer lives at ~/Atrium/peers/<name>/ with:
+#   inbox.jsonl     — messages the orchestrator / other peers send to this peer
+#   outbox.jsonl    — status / replies the peer writes
+#   heartbeat.json  — {ts, pid?, role} atomically rewritten on heartbeat
+#   status.md       — one-line current status for the roster panel
+#
+# Usage:
+#   atrium-peer register <name> <role> [--pid <pid>] [--status "<line>"]
+#   atrium-peer heartbeat <name> [--pid <pid>] [--status "<line>"]
+#   atrium-peer send <name> <message> [--from <sender>] [--kind <kind>]
+#   atrium-peer recv <name>              # drain outbox (stdout)
+#   atrium-peer inbox <name>             # read inbox (non-destructive)
+#   atrium-peer status <name> "<line>"   # update the peer's status.md
+#   atrium-peer list                     # all peers with heartbeat age
+#   atrium-peer unregister <name>        # tombstone (keeps dir, clears live state)
+#
+# Invariants:
+#   - Atomic writes (temp-then-rename) for every mutation.
+#   - Append-only JSONL for inbox/outbox; heartbeat.json is the only rewriter.
+#   - No SQLite. No locking — relies on single-writer per peer for inbox ordering.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_peer"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-peer' is now a cognitive verb. Consider using 'atrium peer' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PEERS_DIR="$ATRIUM_ROOT/peers"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+mkdir -p "$PEERS_DIR"
+
+# ── atomic write helper ────────────────────────────────────────────────
+_atomic_write() {
+  local target="$1" tmp
+  tmp="$(mktemp "${target}.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$target"
+}
+
+# ── JSON line builder (python coerces numbers/bools) ──────────────────
+_json_line() {
+  python3 - "$@" <<'PY'
+import sys, json, datetime
+event = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+for a in sys.argv[1:]:
+    if "=" not in a:
+        raise SystemExit(f"bad kv: {a!r}")
+    k, v = a.split("=", 1)
+    try: event[k] = json.loads(v)
+    except Exception: event[k] = v
+print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+# ── subcommands ───────────────────────────────────────────────────────
+cmd_register() {
+  local name="${1:?atrium-peer register: need name}"
+  local role="${2:?atrium-peer register: need role}"; shift 2
+  local pid="" status=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pid) pid="$2"; shift 2 ;;
+      --status) status="$2"; shift 2 ;;
+      *) echo "atrium-peer register: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local dir="$PEERS_DIR/$name"
+  mkdir -p "$dir"
+  : > "$dir/inbox.jsonl"  # create if missing (empty file)
+  : > "$dir/outbox.jsonl"
+
+  # heartbeat.json — atomic write
+  local hb_args=("role=$role")
+  [[ -n "$pid" ]] && hb_args+=("pid=$pid")
+  _json_line "${hb_args[@]}" | _atomic_write "$dir/heartbeat.json"
+
+  # status.md
+  [[ -z "$status" ]] && status="registered — $role"
+  printf "%s\n" "$status" | _atomic_write "$dir/status.md"
+
+  "$TRACER" peer_register name="$name" role="$role" >/dev/null 2>&1 || true
+  echo "registered: $name ($role)"
+}
+
+cmd_heartbeat() {
+  local name="${1:?atrium-peer heartbeat: need name}"; shift
+  local pid="" status=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pid) pid="$2"; shift 2 ;;
+      --status) status="$2"; shift 2 ;;
+      *) echo "atrium-peer heartbeat: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || { echo "atrium-peer heartbeat: peer not registered: $name" >&2; exit 3; }
+
+  # preserve the role from existing heartbeat.json
+  local role
+  role=$(python3 -c "import json; print(json.load(open('$dir/heartbeat.json')).get('role',''))" 2>/dev/null || echo "")
+
+  local hb_args=("role=$role")
+  [[ -n "$pid" ]] && hb_args+=("pid=$pid")
+  _json_line "${hb_args[@]}" | _atomic_write "$dir/heartbeat.json"
+
+  [[ -n "$status" ]] && printf "%s\n" "$status" | _atomic_write "$dir/status.md"
+}
+
+cmd_send() {
+  local name="${1:?atrium-peer send: need name}"
+  local msg="${2:?atrium-peer send: need message}"; shift 2
+  local sender="orchestrator" kind="msg"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) sender="$2"; shift 2 ;;
+      --kind) kind="$2"; shift 2 ;;
+      *) echo "atrium-peer send: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || { echo "atrium-peer send: peer not registered: $name" >&2; exit 3; }
+
+  _json_line "from=$sender" "msg_kind=$kind" "message=$msg" >> "$dir/inbox.jsonl"
+  "$TRACER" peer_send to="$name" from="$sender" msg_kind="$kind" >/dev/null 2>&1 || true
+  echo "sent: $name $kind (${#msg}b)"
+}
+
+cmd_recv() {
+  local name="${1:?atrium-peer recv: need name}"
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || { echo "atrium-peer recv: peer not registered: $name" >&2; exit 3; }
+  # Print outbox then truncate atomically (single-consumer assumption)
+  if [[ -s "$dir/outbox.jsonl" ]]; then
+    cat "$dir/outbox.jsonl"
+    : | _atomic_write "$dir/outbox.jsonl"
+  fi
+}
+
+cmd_inbox() {
+  local name="${1:?atrium-peer inbox: need name}"
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || { echo "atrium-peer inbox: peer not registered: $name" >&2; exit 3; }
+  cat "$dir/inbox.jsonl" 2>/dev/null || true
+}
+
+cmd_status() {
+  local name="${1:?atrium-peer status: need name}"
+  local line="${2:?atrium-peer status: need status line}"
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || { echo "atrium-peer status: peer not registered: $name" >&2; exit 3; }
+  printf "%s\n" "$line" | _atomic_write "$dir/status.md"
+}
+
+cmd_list() {
+  # Flags: --all shows tombstoned peers (unregistered, heartbeat.json removed)
+  # inline with the live roster. Default hides them under a "tombstoned" footer.
+  local show_all=0
+  for a in "$@"; do [[ "$a" == "--all" ]] && show_all=1; done
+
+  python3 - "$PEERS_DIR" "$show_all" <<'PY'
+import sys, os, json, datetime, time
+from pathlib import Path
+
+root = Path(sys.argv[1])
+show_all = sys.argv[2] == "1"
+if not root.exists():
+    sys.exit(0)
+
+now = datetime.datetime.now().astimezone()
+live, tombs = [], []
+for d in sorted(root.iterdir()):
+    if not d.is_dir(): continue
+    hb = d / "heartbeat.json"
+    if not hb.exists():
+        tombs.append(d.name)
+        continue
+    try:
+        data = json.loads(hb.read_text())
+    except Exception:
+        live.append((d.name, "?", "(corrupt heartbeat)", ""))
+        continue
+    ts = data.get("ts", "")
+    role = data.get("role", "")
+    try:
+        t = datetime.datetime.fromisoformat(ts)
+        age_s = (now - t).total_seconds()
+        if age_s < 60: age = f"{int(age_s)}s"
+        elif age_s < 3600: age = f"{int(age_s/60)}m"
+        else: age = f"{int(age_s/3600)}h"
+    except Exception:
+        age = "?"
+    status = ""
+    sp = d / "status.md"
+    if sp.exists():
+        status = sp.read_text().strip().split("\n", 1)[0]
+    live.append((d.name, role, age, status))
+
+rows = list(live)
+if show_all:
+    rows += [(n, "—", "tomb", "(unregistered)") for n in tombs]
+
+if not rows and not tombs:
+    print("(no peers registered)")
+else:
+    if rows:
+        w_name = max(len(r[0]) for r in rows)
+        w_role = max(len(r[1]) for r in rows)
+        for name, role, age, status in rows:
+            print(f"{name:<{w_name}}  {role:<{w_role}}  hb {age:<4}  {status}")
+    if tombs and not show_all:
+        print(f"— {len(tombs)} tombstoned: {', '.join(tombs)} (--all to inline)")
+PY
+}
+
+cmd_unregister() {
+  local name="${1:?atrium-peer unregister: need name}"
+  local dir="$PEERS_DIR/$name"
+  [[ -d "$dir" ]] || return 0
+  # Clear live state but keep the dir as a tombstone (audit trail)
+  rm -f "$dir/heartbeat.json"
+  printf "(unregistered)\n" | _atomic_write "$dir/status.md"
+  "$TRACER" peer_unregister name="$name" >/dev/null 2>&1 || true
+  echo "unregistered: $name"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────
+case "${1:-}" in
+  register)   shift; cmd_register    "$@" ;;
+  heartbeat)  shift; cmd_heartbeat   "$@" ;;
+  send)       shift; cmd_send        "$@" ;;
+  recv)       shift; cmd_recv        "$@" ;;
+  inbox)      shift; cmd_inbox       "$@" ;;
+  status)     shift; cmd_status      "$@" ;;
+  list)       shift; cmd_list        "$@" ;;
+  unregister) shift; cmd_unregister  "$@" ;;
+  ""|help|--help|-h) sed -n '2,20p' "$0" ;;
+  *) echo "atrium-peer: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

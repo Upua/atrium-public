@@ -1,0 +1,290 @@
+#!/usr/bin/env python3.11
+"""
+atrium-embed-daemon — persistent MiniLM + Cortex socket server.
+
+Loads sentence-transformers/all-MiniLM-L6-v2 once at startup (~7s), then services
+requests over a UNIX socket in <100ms per call. Consumers:
+
+  - memory-surface.sh ambient recall hook (UserPromptSubmit, 2s budget)
+  - atrium-embed-source --client (CLI shortcut)
+  - anything else that wants semantic search without eating a cold-load
+
+Socket: $ATRIUM_ROOT/state/embed-daemon.sock (0600, user-owned dir).
+
+Protocol: line-delimited JSON. One JSON object per line in, one per line out.
+
+Ops:
+  {"op":"ping"}
+      → {"ok":true,"uptime_s":N,"served":M}
+  {"op":"embed","text":"..."}
+      → {"ok":true,"vector_b64":"<base64 of f32[384]>"}
+  {"op":"query_all","text":"...","limit":8}
+      → {"ok":true,"hits":[{"score":0.71,"source_table":"...","source_id":N,"preview":"..."}]}
+
+Errors:
+  → {"ok":false,"error":"<message>"}
+
+Shutdown: SIGTERM triggers clean exit (removes socket, closes Store). SIGINT same.
+Managed via `atrium-daemon start embed-daemon -- /path/to/atrium-embed-daemon`.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import signal
+import socket
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+ATRIUM_ROOT = Path(os.environ.get("ATRIUM_ROOT", str(Path.home() / "Atrium")))
+SOCKET_PATH = ATRIUM_ROOT / "state" / "embed-daemon.sock"
+CORTEX_SRC = Path(
+    os.environ.get("ATRIUM_CORTEX_SRC", "~/cortex/src")
+).expanduser()
+PREVIEW_DB = ATRIUM_ROOT / "state" / "embedding_previews.sqlite"
+
+if str(CORTEX_SRC) not in sys.path:
+    sys.path.insert(0, str(CORTEX_SRC))
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+MAX_LINE = 1 << 20  # 1 MB per request line — generous but bounded
+QUERY_LIMIT_DEFAULT = 8
+QUERY_LIMIT_CAP = 50
+
+
+def log(msg: str) -> None:
+    print(f"[embed-daemon {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class EmbedServer:
+    def __init__(self) -> None:
+        self.started_at = time.time()
+        self.served = 0
+        self.sock: socket.socket | None = None
+
+        log("loading MiniLM (cold-start, ~7s)...")
+        t0 = time.time()
+        from cortex.embedder import embed, vector_to_bytes  # warms model on first embed
+        self._embed = embed
+        self._vec_to_bytes = vector_to_bytes
+        # Force actual model load now so first request isn't the one that pays the cost
+        _ = embed("warmup")
+        log(f"model loaded ({time.time() - t0:.2f}s)")
+
+        log("opening cortex Store...")
+        from cortex.store import Store
+        self._store_cls = Store
+        self.store = Store()
+        self.store.connect()
+        log("cortex Store connected")
+
+        self.preview_conn = sqlite3.connect(str(PREVIEW_DB))
+        self.preview_conn.row_factory = sqlite3.Row
+        # The table exists already from atrium-embed-source; this CREATE IF NOT EXISTS
+        # is defensive for first-run scenarios.
+        self.preview_conn.execute(
+            "CREATE TABLE IF NOT EXISTS previews ("
+            "  source_table TEXT NOT NULL,"
+            "  source_id    INTEGER NOT NULL,"
+            "  preview_text TEXT NOT NULL,"
+            "  ts_created   REAL NOT NULL,"
+            "  UNIQUE(source_table, source_id))"
+        )
+        self.preview_conn.commit()
+
+    # ------------------------------------------------------------------ #
+
+    def handle_ping(self, req: dict) -> dict:
+        return {
+            "ok": True,
+            "uptime_s": int(time.time() - self.started_at),
+            "served": self.served,
+        }
+
+    def handle_embed(self, req: dict) -> dict:
+        text = req.get("text")
+        if not isinstance(text, str) or not text:
+            return {"ok": False, "error": "embed requires non-empty 'text'"}
+        vec = self._embed(text)
+        raw = self._vec_to_bytes(vec)
+        return {"ok": True, "vector_b64": base64.b64encode(raw).decode("ascii")}
+
+    def handle_query_all(self, req: dict) -> dict:
+        text = req.get("text")
+        if not isinstance(text, str) or not text:
+            return {"ok": False, "error": "query_all requires non-empty 'text'"}
+        limit = int(req.get("limit", QUERY_LIMIT_DEFAULT))
+        limit = max(1, min(limit, QUERY_LIMIT_CAP))
+
+        q_bytes = self._vec_to_bytes(self._embed(text))
+        source_tables = [
+            r["source_table"]
+            for r in self.store._conn.execute(
+                "SELECT DISTINCT source_table FROM embeddings"
+            ).fetchall()
+        ]
+        all_hits: list[tuple[float, str, int]] = []
+        for src in source_tables:
+            for h in self.store.find_by_vector(src, q_bytes, limit=limit):
+                all_hits.append((float(h["score"]), src, int(h["source_id"])))
+        all_hits.sort(key=lambda t: -t[0])
+        top = all_hits[:limit]
+
+        hits = []
+        for score, src, sid in top:
+            hits.append({
+                "score": round(score, 4),
+                "source_table": src,
+                "source_id": sid,
+                "preview": self._preview(src, sid),
+            })
+        return {"ok": True, "hits": hits}
+
+    def _preview(self, source_table: str, source_id: int) -> str:
+        row = self.preview_conn.execute(
+            "SELECT preview_text FROM previews WHERE source_table=? AND source_id=?",
+            (source_table, source_id),
+        ).fetchone()
+        if row:
+            return row["preview_text"]
+        # Fallback: Cortex-native tables
+        try:
+            if source_table == "solutions":
+                r = self.store._conn.execute(
+                    "SELECT substr(problem, 1, 90) AS p FROM solutions WHERE id=?",
+                    (source_id,),
+                ).fetchone()
+                return r["p"] if r else ""
+            if source_table.startswith("events"):
+                r = self.store._conn.execute(
+                    "SELECT substr(summary, 1, 90) AS p FROM events WHERE id=?",
+                    (source_id,),
+                ).fetchone()
+                return r["p"] if r else ""
+            if source_table == "sessions":
+                r = self.store._conn.execute(
+                    "SELECT substr(summary, 1, 90) AS p FROM sessions WHERE id=?",
+                    (source_id,),
+                ).fetchone()
+                return r["p"] if r else ""
+        except Exception:
+            pass
+        return ""
+
+    # ------------------------------------------------------------------ #
+
+    HANDLERS = {
+        "ping": "handle_ping",
+        "embed": "handle_embed",
+        "query_all": "handle_query_all",
+    }
+
+    def dispatch(self, req: dict) -> dict:
+        op = req.get("op")
+        name = self.HANDLERS.get(op)
+        if not name:
+            return {"ok": False, "error": f"unknown op: {op!r}"}
+        try:
+            return getattr(self, name)(req)
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def serve_connection(self, conn: socket.socket) -> None:
+        buf = b""
+        try:
+            conn.settimeout(5.0)
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_LINE:
+                    conn.sendall(b'{"ok":false,"error":"line too long"}\n')
+                    return
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        req = json.loads(line.decode("utf-8"))
+                    except Exception as exc:
+                        resp = {"ok": False, "error": f"bad json: {exc}"}
+                    else:
+                        resp = self.dispatch(req)
+                    self.served += 1
+                    conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+        except socket.timeout:
+            pass
+        except Exception as exc:
+            log(f"conn error: {exc}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        if SOCKET_PATH.exists():
+            SOCKET_PATH.unlink()
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(str(SOCKET_PATH))
+        os.chmod(SOCKET_PATH, 0o600)
+        self.sock.listen(8)
+        log(f"listening on {SOCKET_PATH}")
+
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                break  # socket closed by shutdown
+            self.serve_connection(conn)
+
+    def shutdown(self) -> None:
+        log("shutdown: closing socket and store")
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        try:
+            self.preview_conn.close()
+        except Exception:
+            pass
+        try:
+            if SOCKET_PATH.exists():
+                SOCKET_PATH.unlink()
+        except Exception:
+            pass
+
+
+def main() -> int:
+    server = EmbedServer()
+
+    def _sigterm(signum, frame):
+        log(f"got signal {signum}")
+        server.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
+    try:
+        server.run()
+    finally:
+        server.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

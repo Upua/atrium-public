@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# atrium — summon the AI-native workspace.
+#
+# Spawns a dedicated Kitty instance (--class atrium, Atrium config) and
+# drops into Zellij with Atrium's config dir and default layout. Niklas's
+# daily Kitty is untouched.
+#
+# Flags:
+#   (no flag)  smart-attach: reattach if an 'atrium' zellij session exists,
+#              else create a fresh one with the default layout
+#   --fresh    force-delete any existing session and start new
+#   --attach   explicit reattach-only (fails if no session exists)
+#   --layout L layout name for fresh launches (default: agent-v0)
+#   --help     show this
+#
+# Exit: takes over the terminal; exits when Kitty closes.
+
+set -euo pipefail
+
+# PATH guard FIRST — GNOME-launched processes (.desktop / hotkey) don't
+# inherit shell PATH, so ~/.local/bin (where kitty/zellij live) must be
+# re-added before any `command -v` preflight or the launcher fails.
+case ":${PATH:-}:" in
+  *:"$HOME/.local/bin":*) ;;
+  *) export PATH="$HOME/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}" ;;
+esac
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+
+# --- DISPATCHER LOGIC ---
+# If the first argument does not start with '-', try to dispatch it as a subcommand.
+if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
+  VERB="$1"
+  shift
+  
+  if [[ "$VERB" == "observe" ]]; then
+    ATRIUM_DISPATCHED=1 exec "$ATRIUM_ROOT/bin/atrium-sense" "$@"
+  elif [[ -x "$ATRIUM_ROOT/bin/atrium-$VERB" ]]; then
+    ATRIUM_DISPATCHED=1 exec "$ATRIUM_ROOT/bin/atrium-$VERB" "$@"
+  else
+    echo "atrium: unknown command '$VERB'" >&2
+    if [[ -x "$ATRIUM_ROOT/bin/atrium-help" ]]; then
+      "$ATRIUM_ROOT/bin/atrium-help"
+    fi
+    exit 1
+  fi
+fi
+# ------------------------
+
+
+KITTY_CONF="$ATRIUM_ROOT/kitty/kitty.conf"
+ZELLIJ_DIR="$ATRIUM_ROOT/zellij"
+LAYOUT="agent-v0"
+ATTACH=0
+FRESH=0
+LOG="$ATRIUM_ROOT/state/launch.log"
+mkdir -p "$(dirname "$LOG")"
+
+# Log every launch so we can debug future failures from GNOME triggers
+{
+  echo "--- $(date -Iseconds) launch ---"
+  echo "PATH=$PATH"
+  echo "argv: $*"
+} >> "$LOG" 2>&1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --attach)   ATTACH=1; shift ;;
+    --fresh)    FRESH=1;  shift ;;
+    --layout)   LAYOUT="$2"; shift 2 ;;
+    --help|-h)  sed -n '2,16p' "$0"; exit 0 ;;
+    *)          echo "atrium: unknown arg: $1" | tee -a "$LOG" >&2; exit 2 ;;
+  esac
+done
+
+# Preflight
+command -v kitty  >/dev/null || { echo "atrium: kitty not found on PATH ($PATH)" | tee -a "$LOG" >&2; exit 1; }
+command -v zellij >/dev/null || { echo "atrium: zellij not found on PATH ($PATH)" | tee -a "$LOG" >&2; exit 1; }
+[[ -r "$KITTY_CONF" ]] || { echo "atrium: missing $KITTY_CONF" | tee -a "$LOG" >&2; exit 1; }
+[[ -d "$ZELLIJ_DIR" ]] || { echo "atrium: missing $ZELLIJ_DIR" | tee -a "$LOG" >&2; exit 1; }
+
+# Decide zellij invocation based on flags + existing-session state.
+# Smart-attach by default: if an 'atrium' session exists, reattach (restores
+# layout + scrollback). If not, create fresh with the layout.
+#
+# --attach = explicit reattach-only; fail if no session exists.
+# --fresh  = delete any existing session and always start new.
+#
+# wrap in 'bash -lc "exec zellij ..."' — direct 'kitty -- zellij' has a
+# TTY-handoff quirk on kitty-inside-kitty X11 where zellij creates its
+# session but the client UI exits within milliseconds.
+EXISTING=$(zellij --config-dir "$ZELLIJ_DIR" list-sessions --no-formatting 2>/dev/null | awk '{print $1}' | grep -Fx "atrium" || true)
+
+if [[ "$FRESH" -eq 1 ]]; then
+  [[ -n "$EXISTING" ]] && zellij --config-dir "$ZELLIJ_DIR" delete-session atrium --force >/dev/null 2>&1 || true
+  ZELLIJ_INVOCATION="exec zellij --config-dir $ZELLIJ_DIR -s atrium -n $LAYOUT"
+elif [[ "$ATTACH" -eq 1 ]]; then
+  if [[ -z "$EXISTING" ]]; then
+    echo "atrium: --attach requested but no 'atrium' session exists" | tee -a "$LOG" >&2
+    exit 3
+  fi
+  ZELLIJ_INVOCATION="exec zellij --config-dir $ZELLIJ_DIR attach atrium"
+elif [[ -n "$EXISTING" ]]; then
+  # Smart-attach (default)
+  ZELLIJ_INVOCATION="exec zellij --config-dir $ZELLIJ_DIR attach atrium"
+else
+  # Fresh default
+  ZELLIJ_INVOCATION="exec zellij --config-dir $ZELLIJ_DIR -s atrium -n $LAYOUT"
+fi
+ZELLIJ_CMD=(bash -lc "$ZELLIJ_INVOCATION")
+echo "zellij decision: $ZELLIJ_INVOCATION" >> "$LOG"
+
+# Export for child processes (nvim-RPC sockets, etc.)
+export ATRIUM_ROOT
+export ATRIUM_SESSION=atrium
+
+echo "about to exec: kitty --detach --class atrium -- ${ZELLIJ_CMD[*]}" >> "$LOG"
+
+# --detach forks kitty into an independent process, decoupled from the
+# launcher's shell. Without this, when atrium is invoked from inside an
+# existing kitty (which is the common case — launched from a kitty tab,
+# or spawned by GNOME which may proxy through a TTY), the new kitty dies
+# silently within 200ms because of parent-child signal/socket collisions.
+exec kitty \
+  --detach \
+  --class atrium \
+  --title "Atrium" \
+  --config "$KITTY_CONF" \
+  -- "${ZELLIJ_CMD[@]}"

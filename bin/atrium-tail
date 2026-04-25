@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# atrium-tail — pretty-print recent trace events. Color-coded by kind.
+#
+# Usage:
+#   atrium-tail                       # last 20 events
+#   atrium-tail 50                    # last 50
+#   atrium-tail --kind tool           # filter by kind
+#   atrium-tail --session <id>        # filter by session
+#   atrium-tail --cost                # only cost-bearing events (rolling total)
+#   atrium-tail --follow              # tail -f mode
+#
+# Replaces the "tail + python -c" soup we've been doing.
+
+set -euo pipefail
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+
+N=20
+KIND=""
+SESSION=""
+COST=0
+FOLLOW=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kind)    KIND="$2"; shift 2 ;;
+    --session) SESSION="$2"; shift 2 ;;
+    --cost)    COST=1; shift ;;
+    --follow|-f) FOLLOW=1; shift ;;
+    --help|-h) sed -n '2,13p' "$0"; exit 0 ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *)  N="$1"; shift ;;
+  esac
+done
+
+render() {
+  python3 - "$TRACE" "$N" "$KIND" "$SESSION" "$COST" <<'PY'
+import sys, json, os
+from pathlib import Path
+
+trace, N, KIND, SESSION, COST = sys.argv[1:6]
+N = int(N)
+COST = COST == "1"
+
+USE_COLOR = sys.stdout.isatty()
+def c(code, s): return f"\x1b[{code}m{s}\x1b[0m" if USE_COLOR else s
+
+# kind → ANSI color (inherit oxidized-copper palette)
+KCOL = {
+    "tool":          "33",  # brass
+    "cmd":           "33",
+    "commit":        "32",  # olive
+    "handoff_written": "36",  # verdigris
+    "session_begin": "36",
+    "guard_allow":   "2",   # dim
+    "guard_block":   "91",  # copper — alert
+    "kill":          "31",  # red
+    "peer_register": "36",
+    "peer_send":     "36",
+    "peer_unregister":"2",
+    "peer_nvim_spawn":"36",
+    "peer_nvim_edit": "36",
+    "peer_nvim_do":   "36",
+    "peer_nvim_stop": "2",
+    "peer_mascot_spawn":"36",
+    "peer_mascot_stop": "2",
+    "snap":          "33",
+    "msg":           "2",
+    "event":         "2",
+}
+
+def color_kind(k):
+    return c(KCOL.get(k, "2"), k)
+
+# Read tail
+try:
+    with open(trace) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    print("(no trace.jsonl yet)")
+    sys.exit(0)
+
+events = []
+for ln in lines:
+    try: d = json.loads(ln)
+    except: continue
+    if KIND and d.get("kind") != KIND: continue
+    if SESSION and d.get("session") != SESSION: continue
+    if COST and not isinstance(d.get("cost_usd"), (int, float)): continue
+    events.append(d)
+
+events = events[-N:]
+
+if COST:
+    total = 0.0
+    for e in events:
+        total += e.get("cost_usd", 0.0)
+        ts = e.get("ts","")[:19]
+        cost = e.get("cost_usd", 0)
+        model = e.get("model","?")
+        ti = e.get("tokens_in","—")
+        to = e.get("tokens_out","—")
+        print(f"{c('2', ts)}  {c('33', f'${cost:.4f}')}  {c('2', f'in={ti}/out={to}')}  {c('36', model)}  total={c('32', f'${total:.4f}')}")
+    sys.exit()
+
+# Figure out max kind width for alignment
+max_k = max((len(e.get("kind","")) for e in events), default=5)
+max_k = min(max_k, 24)
+
+for e in events:
+    ts = e.get("ts","")[:19].replace("T"," ")
+    k  = e.get("kind","?")
+    kc = color_kind(k)
+    padding = " " * max(0, max_k - len(k))
+
+    # Salient fields per kind
+    bits = []
+    for key in ("tool","subject","to","from","cmd","sha","reason","path","file","tab","msg_kind","payload","op_kind","name","role"):
+        v = e.get(key)
+        if v is None: continue
+        sv = str(v)
+        if len(sv) > 60: sv = sv[:57] + "…"
+        bits.append(f"{c('2', key)}={c('33', sv)}")
+    if isinstance(e.get("cost_usd"), (int, float)):
+        cost_str = f"{e['cost_usd']:.3f}"
+        bits.append(f"{c('2', '$')}{c('32', cost_str)}")
+
+    line = f"{c('2', ts)}  {kc}{padding}  " + "  ".join(bits)
+    print(line)
+PY
+}
+
+if [[ "$FOLLOW" -eq 1 ]]; then
+  render
+  tail -f -n 0 "$TRACE" 2>/dev/null | while IFS= read -r _; do
+    # re-render last N
+    clear 2>/dev/null || true
+    render
+  done
+else
+  render
+fi

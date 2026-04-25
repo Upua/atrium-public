@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# atrium-hud — proprioception, not telemetry.
+#
+# One-line status rendered in a dedicated Zellij pane. Runs in <100ms,
+# refreshed every 2s via `watch -t`. Uses Unicode + Nerd-Font-safe glyphs:
+#   ⌖    sigil (atrium identity)           — color shifts with system state
+#   ↑    uptime marker
+#   ▁▂▃▄▅▆▇█   sparkline (burn rate over last N cost events)
+#   [▓░]       budget meter
+#   ●    trace event dot
+#   ◉    paused / awaiting approval
+#   │    field separator
+#
+# Colors encode state:
+#   sigil brass (yellow)  → normal
+#   sigil copper (red)    → guard active / over-budget
+#   burn/spend green      → < 50% of daily budget
+#   burn/spend amber      → 50-80%
+#   burn/spend red        → ≥ 80%
+#
+# Variant B (balanced) from ~/Atrium/design/IDENTITY.html § HUD.
+# Pass --dense for variant C (adds context-window %, event breakdown, peers).
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+BUDGET_FILE="$ATRIUM_ROOT/state/budget.json"
+
+DENSE=0
+[[ "${1:-}" == "--dense" ]] && DENSE=1
+
+python3 - "$TRACE" "$BUDGET_FILE" "$DENSE" <<'PY'
+import sys, json, statistics, datetime
+from pathlib import Path
+
+trace_path = Path(sys.argv[1])
+budget_path = Path(sys.argv[2])
+DENSE = sys.argv[3] == "1"
+
+# ── ANSI helpers ────────────────────────────────────────────────────
+# Use ANSI 16-color indices (30-37, 90-97) so the HUD inherits kitty.conf's
+# `color0..color15` — i.e. the Atrium oxidized-copper palette. Hardcoding
+# 256-color escapes (38;5;N) bypasses the palette and defeats the point.
+USE_COLOR = sys.stdout.isatty()
+def c(code, s): return f"\x1b[{code}m{s}\x1b[0m" if USE_COLOR else s
+# palette role → ANSI index → hex (from kitty.conf):
+BRASS     = "33"    # color3  #d89a4a — brass / sigil / active cue
+COPPER    = "91"    # color9  #d87a4a — bright red / copper alert
+OLIVE     = "32"    # color2  #8ca05a — green / ok
+AMBER     = "93"    # color11 #f0b860 — bright yellow / warn
+RED       = "31"    # color1  #b85a3a — red / guard
+VERD      = "36"    # color6  #6aa090 — cyan / peer / verdigris
+TRACE_DIM = "33;2"  # brass dimmed — trace dot
+DIM       = "2"     # faint
+SEP_COL   = "90"    # color8  #4a3d2e — bright black / separator
+
+# ── budget ──────────────────────────────────────────────────────────
+daily_budget = 10.0
+if budget_path.exists():
+    try:
+        daily_budget = float(json.loads(budget_path.read_text()).get("daily_usd", 10.0))
+    except Exception: pass
+
+# ── parse trace ─────────────────────────────────────────────────────
+events = []
+if trace_path.exists():
+    with trace_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: events.append(json.loads(line))
+            except Exception: continue
+
+today = datetime.date.today().isoformat()
+today_events = [e for e in events if e.get("ts", "").startswith(today)]
+
+spent = sum(e.get("cost_usd", 0.0) for e in today_events
+            if isinstance(e.get("cost_usd"), (int, float)))
+pct   = (spent / daily_budget * 100) if daily_budget > 0 else 0
+
+# uptime: from earliest-today event
+if today_events:
+    t0 = datetime.datetime.fromisoformat(today_events[0]["ts"].replace("Z","+00:00"))
+    now = datetime.datetime.now(t0.tzinfo)
+    uptime_s = max(0, (now - t0).total_seconds())
+else:
+    uptime_s = 0
+
+def fmt_uptime(s):
+    s = int(s)
+    if s < 3600: return f"{s//60}m"
+    h, r = divmod(s, 3600)
+    return f"{h}h{r//60:02d}" if r >= 60 else f"{h}h"
+
+# burn rate — median cost/min over last 20 cost-bearing events
+cost_events = [e for e in today_events
+               if isinstance(e.get("cost_usd"), (int, float)) and e["cost_usd"] > 0]
+if len(cost_events) >= 4:
+    ts    = [datetime.datetime.fromisoformat(e["ts"].replace("Z","+00:00")) for e in cost_events[-20:]]
+    costs = [e["cost_usd"] for e in cost_events[-20:]]
+    per_min = []
+    for i in range(1, len(ts)):
+        dt = (ts[i] - ts[i-1]).total_seconds() / 60
+        if dt > 0: per_min.append(costs[i] / dt)
+    burn = statistics.median(per_min) if per_min else 0
+elif uptime_s > 6 and spent > 0:
+    burn = spent / (uptime_s / 60)
+else:
+    burn = 0
+
+# sparkline from last 10 per-event costs
+spark_chars = "▁▂▃▄▅▆▇█"
+def sparkline(values, width=5):
+    if not values: return "▁" * width
+    vs = values[-width:]
+    if len(vs) < width:
+        vs = [0] * (width - len(vs)) + vs
+    lo, hi = min(vs), max(vs)
+    if hi == lo:
+        return "▁" * width
+    return "".join(spark_chars[min(len(spark_chars)-1,
+                                   int((v - lo) / (hi - lo) * (len(spark_chars)-1))
+                                  )] for v in vs)
+
+spark_burn = sparkline([e["cost_usd"] for e in cost_events[-10:]])
+
+# budget meter — 10-cell block
+meter_cells = 10
+filled = min(meter_cells, int(round(pct / 10))) if pct > 0 else 0
+meter = "▓" * filled + "░" * (meter_cells - filled)
+
+# state color for spend-bearing elements
+if pct >= 80:      state_col = RED;    spend_sig_col = COPPER
+elif pct >= 50:    state_col = AMBER;  spend_sig_col = BRASS
+else:              state_col = OLIVE;  spend_sig_col = BRASS
+
+# ── guard active / paused detection ─────────────────────────────────
+# A guard_block within last 60s is considered "active"
+recent_guard = False
+for e in reversed(today_events):
+    if e.get("kind") == "guard_block":
+        t = datetime.datetime.fromisoformat(e["ts"].replace("Z","+00:00"))
+        if (datetime.datetime.now(t.tzinfo) - t).total_seconds() < 60:
+            recent_guard = True
+        break
+awaiting = False  # plan-gated state — reserved for v0.3
+
+sigil_col = COPPER if (recent_guard or pct >= 80) else BRASS
+
+# last tool age
+tool_events = [e for e in today_events if e.get("kind") == "tool"]
+last_tool_age = "—"
+if tool_events:
+    t = datetime.datetime.fromisoformat(tool_events[-1]["ts"].replace("Z","+00:00"))
+    now = datetime.datetime.now(t.tzinfo)
+    dt = (now - t).total_seconds()
+    last_tool_age = (f"{int(dt)}s" if dt < 60
+                     else f"{int(dt/60)}m" if dt < 3600
+                     else f"{int(dt/3600)}h")
+
+# total events
+total_events = len(today_events)
+
+# ── context-window meter — most valuable resource ──────────────────
+# Sum tokens_in + tokens_out for the latest session. Auto-fire a handoff
+# if we cross 70% and the prior state was below (one-shot guard via a
+# sentinel file in state/).
+ctx_tokens = 0
+ctx_max = 1_000_000
+ctx_pct = 0.0
+latest_session = None
+for e in reversed(today_events):
+    if e.get("session"):
+        latest_session = e["session"]; break
+if latest_session:
+    import os as _os
+    pp = Path(_os.environ.get("ATRIUM_ROOT", str(Path.home() / "Atrium"))) / "state/pricing.json"
+    models = {}
+    if pp.exists():
+        try: models = json.loads(pp.read_text()).get("models", {})
+        except Exception: pass
+    session_model = None
+    latest_msg = None
+    for e in today_events:
+        if e.get("session") != latest_session: continue
+        m = e.get("model")
+        if m and not session_model: session_model = m
+        # Keep the MOST RECENT tool event for this session — its tokens_in +
+        # cache_read + cache_write_5m approximate current context size.
+        # (Each assistant message's usage is per-call, but the cache_read
+        # field tracks the cumulative conversation history from prior turns.)
+        if e.get("kind") == "tool" and isinstance(e.get("tokens_in"), int):
+            latest_msg = e
+    if latest_msg:
+        ctx_tokens = (
+            (latest_msg.get("tokens_in") or 0)
+            + (latest_msg.get("tokens_cache_read") or 0)
+            + (latest_msg.get("tokens_cache_write_5m") or 0)
+            + (latest_msg.get("tokens_cache_write_1h") or 0)
+        )
+    if session_model and session_model in models:
+        ctx_max = models[session_model].get("max_context", 200_000)
+    ctx_pct = (ctx_tokens / ctx_max * 100) if ctx_max else 0
+
+# one-shot handoff at 70% context
+if ctx_pct >= 70:
+    import os as _os
+    sentinel = Path(_os.environ.get("ATRIUM_ROOT", str(Path.home() / "Atrium"))) / "state/ctx-handoff-fired"
+    fired_session = sentinel.read_text().strip() if sentinel.exists() else ""
+    if fired_session != latest_session:
+        try:
+            import subprocess
+            subprocess.run(
+                [str(Path(_os.environ.get("ATRIUM_ROOT", str(Path.home() / "Atrium"))) / "bin/atrium-handoff"),
+                 "write", "--reason", f"context-threshold-{int(ctx_pct)}pct"],
+                check=False, capture_output=True, timeout=5
+            )
+            sentinel.write_text(latest_session or "")
+        except Exception:
+            pass
+
+# ── compose line ────────────────────────────────────────────────────
+SEP = c(SEP_COL, "│")
+sigil = c(sigil_col, "⌖ atrium")
+uptime_s_str = fmt_uptime(uptime_s)
+
+if DENSE:
+    # variant C — max info
+    tool_n  = len(tool_events)
+    guard_n = sum(1 for e in today_events if e.get("kind", "").startswith("guard"))
+    peer_n  = sum(1 for e in today_events if e.get("kind") == "peer_heartbeat")
+
+    # context color: green <50, amber <70, red ≥70
+    if ctx_pct >= 70:   ctx_col_d = RED
+    elif ctx_pct >= 50: ctx_col_d = AMBER
+    else:               ctx_col_d = OLIVE
+
+    parts = [
+        c(sigil_col, "⌖"),
+        c("1", uptime_s_str),
+        f"{c(DIM,'b')}{c(TRACE_DIM, spark_burn)}{c(state_col, f'{burn:.3f}')}{c(DIM,'/m')}",
+        f"{c(DIM,'$')}{c(state_col, f'{spent:.2f}')}{c(DIM,'/')}{c('1', f'{daily_budget:.2f}')} {c(state_col, f'({pct:.1f}%)')}",
+        f"{c(DIM,'ctx')}{c(ctx_col_d, f'{ctx_pct:.0f}%')}",
+        f"{c(DIM,'ev')}{total_events} {c(DIM,'tool')}{tool_n} {c(DIM,'guard')}{c(OLIVE, guard_n)}",
+        f"{c(DIM,'peer')}{c(VERD, f'{peer_n}↑')}",
+        f"{c(DIM,'last')}{c('1', f't·{last_tool_age}')}",
+    ]
+else:
+    # variant B — balanced (default)
+    # context color: green <50, amber <70, red ≥70 (70 is our handoff trigger)
+    if ctx_pct >= 70:   ctx_col = RED
+    elif ctx_pct >= 50: ctx_col = AMBER
+    else:               ctx_col = OLIVE
+    ctx_k = f"{ctx_tokens//1000}k" if ctx_tokens else "0"
+    ctx_max_k = f"{ctx_max//1000}k"
+
+    parts = [
+        sigil,
+        f"{c(BRASS, '↑' + uptime_s_str)}",
+        f"{c(DIM,'burn')} {c(TRACE_DIM, spark_burn)} {c(state_col, f'${burn:.2f}/m')}",
+        f"{c(DIM,'spend')} {c(state_col, f'[{meter}]')} {c('1', f'${spent:.2f}')} {c(DIM,'of')} {c('1', f'${daily_budget:.0f}')}",
+        f"{c(DIM,'ctx')} {c(ctx_col, f'{ctx_pct:.0f}%')} {c(DIM, f'{ctx_k}/{ctx_max_k}')}",
+        f"{c(DIM,'last')} {c(VERD, f'tool·{last_tool_age}')}",
+    ]
+    # banner on rightmost field in severity order
+    if ctx_pct >= 70:
+        parts[-1] = c(BRASS, "◉ near context limit · handoff written")
+    elif recent_guard or pct >= 80:
+        parts[-1] = c(RED, "GUARD · budget ≥80%" if pct >= 80 else "GUARD · block")
+    elif awaiting:
+        parts[-1] = c(BRASS, "◉ awaiting approval")
+
+print(f" {SEP} ".join(parts))
+PY

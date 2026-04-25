@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# atrium-commit — git checkpoint + walkthrough.md update + trace event.
+#
+# Usage:
+#   atrium-commit "<subject>"                       # commit ATRIUM_ROOT (scoped-sweep + lock)
+#   atrium-commit "<subject>" -- file1 file2        # commit only the listed files
+#   atrium-commit --repo <path> "<subject>" [...]   # commit a specific repo
+#
+# Behavior:
+#   1. Default repo is $ATRIUM_ROOT (was $PWD — broke when invoked elsewhere).
+#   2. If explicit files follow `--`, stage only those; otherwise `git add -A`.
+#   3. Serializes via flock on .git/atrium-commit.lock — prevents the
+#      multi-agent race where concurrent sweeps make commit messages
+#      diverge from their diffs.
+#   4. If nothing staged → exit 0 with "nothing to commit" (no error).
+#   5. `git commit` with subject + Co-Authored-By footer.
+#   6. Append a dated entry to ~/Atrium/brain/walkthrough.md with commit SHA.
+#   7. Emit commit event to trace.jsonl.
+#
+# All file writes atomic (temp-then-rename).
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_commit"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-commit' is now a cognitive verb. Consider using 'atrium commit' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+WALKTHROUGH="$ATRIUM_ROOT/brain/walkthrough.md"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+REPO="$ATRIUM_ROOT"
+SUBJECT=""
+FILES=()
+SAW_DASHDASH=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO="$2"; shift 2 ;;
+    --help|-h) sed -n '2,20p' "$0"; exit 0 ;;
+    --) SAW_DASHDASH=1; shift; while [[ $# -gt 0 ]]; do FILES+=("$1"); shift; done ;;
+    -*) echo "atrium-commit: unknown flag: $1" >&2; exit 2 ;;
+    *)  SUBJECT="${SUBJECT:+$SUBJECT }$1"; shift ;;
+  esac
+done
+
+[[ -n "$SUBJECT" ]] || { echo "atrium-commit: need a subject" >&2; exit 2; }
+[[ -d "$REPO/.git" ]] || { echo "atrium-commit: not a git repo: $REPO" >&2; exit 3; }
+
+cd "$REPO"
+
+# Serialize concurrent atrium-commits on the same repo. Prevents the
+# multi-agent race where both sweeps grab each other's dirty files.
+LOCK_FD=9
+exec 9>".git/atrium-commit.lock"
+flock -x -w 10 $LOCK_FD || { echo "atrium-commit: lock contention >10s, aborting" >&2; exit 4; }
+
+if [[ $SAW_DASHDASH -eq 1 && ${#FILES[@]} -gt 0 ]]; then
+  git add -- "${FILES[@]}"
+else
+  git add -A
+fi
+
+# Is there anything to commit?
+if git diff --cached --quiet; then
+  echo "atrium-commit: nothing to commit in $REPO"
+  exit 0
+fi
+
+# Build commit message with Atrium footer (different from your hand-crafted ones)
+MSG=$(printf '%s\n\nCo-Authored-By: atrium <atrium@local>\n' "$SUBJECT")
+
+git -c user.email="atrium@local" -c user.name="atrium" commit -q -m "$MSG"
+SHA=$(git rev-parse --short HEAD)
+
+# --- Atomic append to walkthrough.md ---
+# Can't literally append-atomic via shell, but we write a copy-plus-entry
+# and rename, so readers never see a partial state.
+if [[ -f "$WALKTHROUGH" ]]; then
+  TMP="$(mktemp "${WALKTHROUGH}.XXXXXX")"
+  cat "$WALKTHROUGH" > "$TMP"
+  cat >> "$TMP" <<ENTRY
+
+---
+
+### $(date -Iseconds | cut -c1-19) — \`$SHA\` $SUBJECT
+(atrium-commit in \`$REPO\`)
+ENTRY
+  mv "$TMP" "$WALKTHROUGH"
+fi
+
+"$TRACER" commit sha="$SHA" subject="$SUBJECT" repo="$REPO" >/dev/null 2>&1 || true
+
+# Embed-scan: pick up the new walkthrough entry + any other new content.
+# Async so commit stays fast. Logs to cache for debugging.
+if [[ -x "$ATRIUM_ROOT/bin/atrium-embed-source" ]]; then
+  ( "$ATRIUM_ROOT/bin/atrium-embed-source" scan-all \
+    >> "$HOME/.claude/cache/atrium-embed-scan.log" 2>&1 ) &
+fi
+
+# Refresh claude-as-peer status so the roster panel shows the latest commit.
+# Only ping if atrium-self is already running — we don't want atrium-commit
+# from a non-atrium context to register a phantom peer.
+if "$ATRIUM_ROOT/bin/atrium-self" is-running 2>/dev/null; then
+  "$ATRIUM_ROOT/bin/atrium-self" status "committed: $(echo "$SUBJECT" | head -c 60)" >/dev/null 2>&1 || true
+fi
+
+echo "✓ $SHA $SUBJECT"

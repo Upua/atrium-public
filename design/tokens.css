@@ -1,0 +1,92 @@
+/* Atrium Identity v0 — tokens
+ * Palette: "oxidized copper" — charcoal substrate, brass+copper warmth,
+ * bone-white text, restrained cool states. ANSI 16 + 4 accents + surfaces.
+ * Every color chosen deliberately; rationale in IDENTITY.html § Color.
+ */
+
+:root {
+  /* ── Substrate ────────────────────────────────────────────────── */
+  --bg:          #0f0c0a;   /* charcoal with a breath of umber       */
+  --bg-raised:   #15110d;   /* pane interior, 1 step up from frame   */
+  --bg-sunk:     #0a0806;   /* HUD + status bar trough               */
+  --fg:          #e8dcc4;   /* bone-white, warm cast — ink on vellum */
+  --fg-dim:      #9a8c74;   /* muted prose, metadata                 */
+  --fg-faint:    #5a4f3e;   /* pane frames, inactive rules           */
+  --selection:   #3a2d1a;   /* warm underpaint for selection         */
+  --selection-fg:#ffffff;
+  --cursor:      #d89a4a;   /* brass beam — signals active cognition */
+
+  /* ── ANSI 16 (kitty color0..color15) ──────────────────────────── */
+  --c0:  #1a1410;   /* black        — frame lines, muted chrome     */
+  --c1:  #b85a3a;   /* red          — oxidized iron; errors         */
+  --c2:  #8ca05a;   /* green        — olive; allowed, under-budget  */
+  --c3:  #d89a4a;   /* yellow       — brass; cursors, active cues   */
+  --c4:  #7a9ab0;   /* blue         — weathered denim; info, URLs   */
+  --c5:  #b07a9a;   /* magenta      — dried rose; rare accents      */
+  --c6:  #6aa090;   /* cyan         — verdigris; agent voice        */
+  --c7:  #c9baa0;   /* white        — parchment; default text       */
+  --c8:  #4a3d2e;   /* bright black — dim scaffolding               */
+  --c9:  #d87a4a;   /* bright red   — copper alarm; guard blocks    */
+  --c10: #a8c070;   /* bright green — fresh olive; success          */
+  --c11: #f0b860;   /* bright yellow— polished brass; warnings      */
+  --c12: #98b8d0;   /* bright blue  — sky through oculus            */
+  --c13: #d09ab8;   /* bright magenta — dawn; rare highlight        */
+  --c14: #8ac0b0;   /* bright cyan  — agent identity accent         */
+  --c15: #ffffff;   /* bright white — strongest emphasis only       */
+
+  /* ── 4 accent roles (named by function, NOT by hue) ───────────── */
+  --accent-plan:  #d89a4a;  /* brass     — plan / approval / ritual */
+  --accent-peer:  #8ac0b0;  /* verdigris — peers, handoffs, links   */
+  --accent-trace: #c9a060;  /* dim brass — trace lines, sparklines  */
+  --accent-alert: #d87a4a;  /* copper    — guard block, over-budget */
+
+  /* ── Semantic state ──────────────────────────────────────────── */
+  --ok:      var(--c10);
+  --warn:    var(--c11);
+  --error:   var(--c9);
+  --info:    var(--c12);
+  --dim:     var(--fg-dim);
+
+  /* ── Type ────────────────────────────────────────────────────── */
+  --font-mono: "Berkeley Mono", "IBM Plex Mono", "JetBrains Mono",
+               "FiraCode Nerd Font", "Fira Code", ui-monospace, monospace;
+  --font-display: "Berkeley Mono", "IBM Plex Mono", ui-monospace, monospace;
+
+  --fs-xs:   11px;
+  --fs-sm:   12px;
+  --fs-base: 13px;
+  --fs-md:   14px;
+  --fs-lg:   18px;
+  --fs-xl:   24px;
+  --fs-2xl:  36px;
+  --fs-display: 64px;
+
+  --lh-tight: 1.1;
+  --lh-base:  1.35;  /* ~cell-height 90% ratio from kitty.conf       */
+  --lh-loose: 1.55;
+
+  --cell-w: 7.8px;   /* approx mono cell @ 13px                      */
+  --cell-h: 17.5px;  /* 13px × 1.35                                  */
+
+  /* ── Borders / no shadows / no radii ─────────────────────────── */
+  --border: 1px solid var(--fg-faint);
+  --border-bright: 1px solid var(--c7);
+  --border-ok:    1px solid var(--c10);
+  --border-warn:  1px solid var(--c11);
+  --border-alert: 1px solid var(--c9);
+  --radius: 0;
+}
+
+/* Document defaults */
+html, body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  font-variant-ligatures: none;
+}
+* { box-sizing: border-box; }

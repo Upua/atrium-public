@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# atrium-help — lists all available Atrium cognitive verbs and infrastructure ops.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+BIN_DIR="$ATRIUM_ROOT/bin"
+
+python3 - "$BIN_DIR" <<'EOF'
+import sys, os
+bin_dir = sys.argv[1]
+if not os.path.isdir(bin_dir):
+    sys.exit(0)
+
+# 12 Cognitive verbs
+VERBS = {
+    "observe": "atrium-sense",
+    "edit": "atrium-edit",
+    "append": "atrium-append",
+    "write": "atrium-write",
+    "commit": "atrium-commit",
+    "peer": "atrium-peer",
+    "plan": "atrium-plan",
+    "guard": "atrium-guard",
+    "decide": "atrium-decide",
+    "recall": "atrium-recall",
+    "handoff": "atrium-handoff",
+    "claim": "atrium-claim",
+    "eval": "atrium-eval",
+    "peer-gui": "atrium-peer-gui"
+}
+
+primitives = []
+
+for filename in os.listdir(bin_dir):
+    if not filename.startswith("atrium-") and filename != "atrium": continue
+    filepath = os.path.join(bin_dir, filename)
+    if not os.path.isfile(filepath) or not os.access(filepath, os.X_OK): continue
+    
+    desc = ""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(f"# {filename}"):
+                    parts = line.split("—", 1)
+                    if len(parts) == 2:
+                        desc = parts[1].strip()
+                    elif "-" in line:
+                        parts = line.split("-", 1)
+                        if len(parts) == 2:
+                            desc = parts[1].strip()
+                    break
+    except Exception:
+        pass
+    
+    primitives.append((filename, desc))
+
+print("Atrium v0.7 Dispatcher (atrium <verb>)")
+print("Cognitive Verbs:")
+
+for verb, script in VERBS.items():
+    desc = next((d for n, d in primitives if n == script), "(not yet implemented)")
+    print(f"  atrium {verb:<13} {desc}")
+
+print("\nInfrastructure Ops:")
+primitives.sort()
+for name, desc in primitives:
+    if name not in VERBS.values() and name != "atrium":
+        print(f"  {name:<20} {desc}")
+EOF

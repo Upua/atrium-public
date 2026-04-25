@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# atrium-nvim — headless Neovim as an Atrium peer. Structural edits via RPC.
+#
+# Spawns `nvim --headless --listen <sock>`, registers it as peer "nvim" in the
+# roster, and exposes simple subcommands for driving it from outside. Every
+# edit/do emits a trace event.
+#
+# Usage:
+#   atrium-nvim spawn                 — start headless nvim, register peer
+#   atrium-nvim edit <file>           — open <file> in the headless nvim
+#   atrium-nvim do '<lua or vimscript>'
+#                                     — run a command (vimscript by default;
+#                                       prefix with "lua " for Lua)
+#   atrium-nvim stop                  — kill the headless nvim, unregister
+#   atrium-nvim sock                  — print the socket path
+#
+# Socket: ~/Atrium/peers/nvim/sock
+# PID:    ~/Atrium/peers/nvim/nvim.pid
+#
+# Heartbeat is refreshed on every edit/do (not a separate daemon; keeps it
+# simple — if you stop using nvim for 5m, the roster shows stale, which is
+# truthful).
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PEER_DIR="$ATRIUM_ROOT/peers/nvim"
+SOCK="$PEER_DIR/sock"
+PIDFILE="$PEER_DIR/nvim.pid"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+PEER_CLI="$ATRIUM_ROOT/bin/atrium-peer"
+
+_is_running() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null || echo "")
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_spawn() {
+  if _is_running; then
+    echo "atrium-nvim: already running (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+
+  mkdir -p "$PEER_DIR"
+  # clean stale socket
+  [[ -S "$SOCK" ]] && python3 -c "import os; os.unlink('$SOCK')" 2>/dev/null || true
+
+  # Prefer atrium-daemon for supervision (auto-restart on crash, peer visibility).
+  # Falls back to raw setsid if atrium-daemon isn't available (during bootstrap).
+  if [[ -x "$ATRIUM_ROOT/bin/atrium-daemon" ]]; then
+    "$ATRIUM_ROOT/bin/atrium-daemon" start nvim -- nvim --headless --listen "$SOCK" >/dev/null
+
+    # Wait for socket to appear (up to 3s)
+    local tries=30
+    while (( tries-- > 0 )); do
+      [[ -S "$SOCK" ]] && break
+      sleep 0.1
+    done
+    [[ -S "$SOCK" ]] || { echo "atrium-nvim: socket didn't appear" >&2; exit 1; }
+
+    # The daemon's child.pid is the nvim pid; mirror to our PIDFILE for _is_running
+    local pid
+    pid=$(cat "$PEER_DIR/child.pid" 2>/dev/null || echo "")
+    [[ -n "$pid" ]] && echo "$pid" > "$PIDFILE"
+
+    # atrium-daemon already registered as peer with role=daemon; override role to editor
+    "$PEER_CLI" heartbeat nvim --pid "$pid" --status "headless · listening on peers/nvim/sock" >/dev/null 2>&1 || true
+    # Refresh heartbeat role by re-registering (status.md stays, role field in heartbeat.json gets role=editor)
+    python3 -c "
+import json
+p = '$PEER_DIR/heartbeat.json'
+try:
+    d = json.load(open(p))
+    d['role'] = 'editor'
+    json.dump(d, open(p, 'w'))
+except Exception: pass
+" 2>/dev/null || true
+
+    "$TRACER" peer_nvim_spawn pid="$pid" sock="$SOCK" via=daemon >/dev/null 2>&1 || true
+    echo "atrium-nvim: spawned via daemon (pid $pid, sock $SOCK)"
+  else
+    # Bootstrap fallback (raw): used before atrium-daemon exists
+    setsid nvim --headless --listen "$SOCK" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+
+    local tries=30
+    while (( tries-- > 0 )); do
+      [[ -S "$SOCK" ]] && break
+      sleep 0.1
+    done
+    [[ -S "$SOCK" ]] || { echo "atrium-nvim: socket didn't appear" >&2; exit 1; }
+
+    "$PEER_CLI" register nvim editor --pid "$pid" --status "headless · listening on peers/nvim/sock"
+    "$TRACER" peer_nvim_spawn pid="$pid" sock="$SOCK" >/dev/null 2>&1 || true
+    echo "atrium-nvim: spawned raw (pid $pid, sock $SOCK)"
+  fi
+}
+
+cmd_edit() {
+  local file="${1:?atrium-nvim edit: need file path}"
+  _is_running || { echo "atrium-nvim: not running (run 'atrium-nvim spawn' first)" >&2; exit 3; }
+
+  local abs
+  abs=$(realpath -m "$file")
+
+  python3 - "$SOCK" "$abs" <<'PY'
+import sys, pynvim
+sock, path = sys.argv[1], sys.argv[2]
+n = pynvim.attach("socket", path=sock)
+# If the file is already the current buffer, skip re-opening — avoids E37
+# ("no write since last change") when re-opening a dirty buffer.
+cur = n.api.eval("expand('%:p')")
+if cur != path:
+    esc = path.replace(" ", "\\ ")
+    n.command(f"edit {esc}")
+n.close()
+PY
+
+  "$PEER_CLI" heartbeat nvim --status "editing $(basename "$abs")"
+  "$TRACER" peer_nvim_edit file="$abs" >/dev/null 2>&1 || true
+  echo "edited: $abs"
+}
+
+cmd_do() {
+  local payload="${1:?atrium-nvim do: need command}"
+  _is_running || { echo "atrium-nvim: not running" >&2; exit 3; }
+
+  local kind="cmd"
+  if [[ "$payload" == lua* ]]; then
+    kind="lua"
+    payload="${payload#lua }"
+  fi
+
+  python3 - "$SOCK" "$kind" "$payload" <<'PY'
+import sys, pynvim
+sock, kind, payload = sys.argv[1], sys.argv[2], sys.argv[3]
+n = pynvim.attach("socket", path=sock)
+if kind == "lua":
+    n.exec_lua(payload, [])
+else:
+    n.command(payload)
+n.close()
+PY
+
+  "$PEER_CLI" heartbeat nvim --status "ran: $(echo "$payload" | head -c 40)"
+  "$TRACER" peer_nvim_do op_kind="$kind" payload="$(echo "$payload" | head -c 120)" >/dev/null 2>&1 || true
+}
+
+cmd_stop() {
+  # If under daemon supervision, stop via daemon (it'll SIGTERM child cleanly)
+  if [[ -f "$PEER_DIR/daemon.pid" && -x "$ATRIUM_ROOT/bin/atrium-daemon" ]]; then
+    "$ATRIUM_ROOT/bin/atrium-daemon" stop nvim
+    rm -f "$PIDFILE" "$SOCK" 2>/dev/null
+    "$TRACER" peer_nvim_stop via=daemon >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if ! _is_running; then
+    echo "atrium-nvim: not running"
+    "$PEER_CLI" unregister nvim 2>/dev/null || true
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PIDFILE")
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  python3 -c "import os; [os.unlink(p) for p in ('$PIDFILE','$SOCK') if os.path.exists(p) or os.path.exists(p + '/.')]" 2>/dev/null || true
+  "$PEER_CLI" unregister nvim 2>/dev/null || true
+  "$TRACER" peer_nvim_stop pid="$pid" >/dev/null 2>&1 || true
+  echo "atrium-nvim: stopped (pid $pid)"
+}
+
+cmd_sock() {
+  echo "$SOCK"
+}
+
+case "${1:-}" in
+  spawn) shift; cmd_spawn "$@" ;;
+  edit)  shift; cmd_edit  "$@" ;;
+  do)    shift; cmd_do    "$@" ;;
+  stop)  shift; cmd_stop  "$@" ;;
+  sock)  shift; cmd_sock ;;
+  ""|help|--help|-h) sed -n '2,17p' "$0" ;;
+  *) echo "atrium-nvim: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

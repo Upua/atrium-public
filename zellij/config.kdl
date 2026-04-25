@@ -1,0 +1,33 @@
+// Zellij config — agent-native workspace
+// Daily-driver v0. Non-colliding keybinds (leader: Ctrl+g).
+// Start in locked mode so keys pass through to Kitty/apps/Neovim by default.
+
+default_mode "locked"
+
+// Clipboard: let Zellij auto-pick (xclip on X11, wl-copy on Wayland).
+// Setting copy_command="wl-copy" explicitly BREAKS zellij startup on X11
+// if wl-copy isn't installed — the launcher looked fine but zellij exited
+// within milliseconds, closing the kitty window. Found the hard way.
+copy_on_select true
+scrollback_editor "/usr/bin/nvim"
+
+// Session resurrection — layout + scrollback across quit/reboot
+session_serialization true
+serialize_pane_viewport true
+scrollback_lines_to_serialize 10000
+
+// Pane frames on — visual anchor while we learn layouts
+pane_frames true
+
+// Mouse on — less purity, more pragmatism
+mouse_mode true
+
+// Theme — atrium (oxidized copper), lives at zellij/themes/atrium.kdl
+// NB: zellij does not expand ~ in theme_dir; must be an absolute path.
+theme "atrium"
+theme_dir "~/Atrium/zellij/themes"
+
+// Default layout when running `zellij` without args
+default_layout "agent-v0"
+
+// Keep keybinds unchanged; default_mode="locked" is the non-colliding lever

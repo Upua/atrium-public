@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# atrium-notify — unified operator notification primitive.
+#
+# Usage:
+#   atrium-notify "message text" [options]
+#
+# Options:
+#   --urgency critical|high|normal|low    urgency tier (default: normal)
+#   --modality auto|voice|telegram|reach|sms|log
+#                                         channel override (default: auto)
+#   --topic <name>                        group messages in a Telegram thread (1h TTL)
+#   --thread-id <id>                      explicit Telegram reply_to_message_id
+#   --sms-to <number>                     phone number for --modality sms
+#   --help, -h                            show this help
+#
+# Routing matrix (--modality auto):
+#   critical  → voice + telegram; reach_ring +30s escalation; bypasses quiet hours
+#   high      → telegram; breadcrumb always
+#   normal    → telegram; breadcrumb always
+#   low       → breadcrumb only (no network)
+#
+# Quiet hours 23:00–07:00 local mute voice + reach_ring.
+# urgency=critical bypasses quiet hours.
+#
+# Silent downgrade on channel failure: telegram → reach text → log.
+# Each fallback is recorded to stderr + breadcrumb.
+#
+# Environment:
+#   ATRIUM_NOTIFY_SENDER  if set, prepends [$ATRIUM_NOTIFY_SENDER] to message
+#   ATRIUM_ROOT           Atrium root dir (default: ~/Atrium)
+#
+# State files:
+#   ~/Atrium/state/notify-threads.json  topic thread state (1h TTL)
+#   ~/Atrium/state/notify.log           append-only structured log
+#
+# Examples:
+#   atrium-notify "deploy done" --urgency normal
+#   atrium-notify "disk full!" --urgency critical
+#   atrium-notify "step 1 started" --topic deploy
+#   atrium-notify "step 2 done"   --topic deploy   # replies to step 1
+#   ATRIUM_NOTIFY_SENDER=embed-agent atrium-notify "finished" --urgency low
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+LIB="$ATRIUM_ROOT/lib/atrium_notify.py"
+
+# ── help short-circuit ─────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  sed -n '2,42p' "$0"
+  exit 0
+fi
+
+# ── sanity checks ─────────────────────────────────────────────────────────────
+if [[ ! -f "$LIB" ]]; then
+  echo "atrium-notify: python helper not found at $LIB" >&2
+  exit 2
+fi
+
+# ── delegate to python helper ──────────────────────────────────────────────────
+exec python3.11 "$LIB" "$@"

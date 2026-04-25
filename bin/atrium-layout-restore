@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# atrium-layout-restore — one-command layout RESET.
+#
+# If the layout gets weird (broken panes, extra tabs, accidental apps, double
+# tabs), run this or hit Super+Shift+R. **Default is a true reset**: kills
+# the atrium kitty window, deletes the session, relaunches fresh with the
+# clean agent-v0 layout. Scrollback is lost — that's the point of a reset.
+#
+# Usage:
+#   atrium-layout-restore              # full reset (kill + atrium --fresh)
+#   atrium-layout-restore --preserve   # additive (add fresh tabs alongside
+#                                       existing broken ones — rare case)
+#   atrium-layout-restore --only work  # --preserve, restore just one tab
+#
+# The default was "additive" in v0.4.1 and that was wrong — users got double
+# tabs and confusion. v0.4.2 makes reset the default, preserve explicit.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+LAYOUT_DIR="$ATRIUM_ROOT/zellij/layouts"
+CONFIG_DIR="$ATRIUM_ROOT/zellij"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+ONLY=""
+PRESERVE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --only) ONLY="$2"; PRESERVE=1; shift 2 ;;
+    --preserve) PRESERVE=1; shift ;;
+    --nuke) PRESERVE=0; shift ;;  # kept for back-compat; now identical to default
+    --help|-h) sed -n '2,14p' "$0"; exit 0 ;;
+    *) echo "atrium-layout-restore: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── Default path: TRUE reset ──────────────────────────────────────────
+if [[ "$PRESERVE" -eq 0 ]]; then
+  echo "atrium-layout-restore: resetting — killing atrium window + fresh relaunch"
+  "$TRACER" layout_restore mode=reset >/dev/null 2>&1 || true
+  # Kill only the MAIN atrium window, not atrium-mascot / atrium-diff peer wins
+  pkill -f "kitty.*--class atrium --" 2>/dev/null || true
+  # Some invocations use ... --title Atrium ... pick those up too
+  pkill -f "kitty.*--class atrium --title Atrium" 2>/dev/null || true
+  # Give kitty a moment to release the zellij socket
+  sleep 1
+  zellij --config-dir "$CONFIG_DIR" kill-session atrium 2>/dev/null || true
+  zellij --config-dir "$CONFIG_DIR" delete-session atrium --force 2>/dev/null || true
+  rm -f /tmp/atrium-kitty.sock-* 2>/dev/null || true
+  exec "$ATRIUM_ROOT/bin/atrium" --fresh
+fi
+
+# Verify atrium session is alive
+if ! zellij --config-dir "$CONFIG_DIR" list-sessions --no-formatting 2>/dev/null | awk '{print $1}' | grep -Fxq "atrium"; then
+  echo "atrium-layout-restore: no live 'atrium' zellij session — nothing to restore into"
+  echo "                      (try: atrium --fresh   or   atrium-layout-restore --nuke)"
+  exit 3
+fi
+
+# Re-add tabs. Zellij's `action new-tab --layout` spawns the FIRST tab defined
+# in the layout file. To target specific tabs, we use --layout-string with a
+# minimal layout that references our agent-v0 template. For v0.4.1 we'll just
+# re-add the full agent-v0 layout as new tabs.
+
+if [[ -n "$ONLY" ]]; then
+  # Extract just the named tab into a transient layout file
+  TMP=$(mktemp --suffix=.kdl)
+  python3 - "$LAYOUT_DIR/agent-v0.kdl" "$ONLY" > "$TMP" <<'PY'
+import sys, re
+path, name = sys.argv[1], sys.argv[2]
+text = open(path).read()
+# Grab default_tab_template
+m = re.search(r'default_tab_template\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\}', text, re.S)
+tpl = m.group(0) if m else ''
+# Grab the named tab block
+pat = re.compile(r'(tab\s+name="' + re.escape(name) + r'"[^{]*\{(?:[^{}]|\{[^{}]*\})*\})', re.S)
+m2 = pat.search(text)
+if not m2:
+    print(f'// tab "{name}" not found', file=sys.stderr)
+    sys.exit(1)
+print("layout {")
+if tpl: print("    " + tpl)
+print("    " + m2.group(1))
+print("}")
+PY
+  LAYOUT_STRING=$(cat "$TMP")
+  rm -f "$TMP"
+  zellij --config-dir "$CONFIG_DIR" action new-tab --layout-string "$LAYOUT_STRING" --name "$ONLY-restored" >/dev/null 2>&1 \
+    && echo "atrium-layout-restore: restored tab '$ONLY' (new tab '$ONLY-restored')" \
+    || echo "atrium-layout-restore: failed to restore '$ONLY'" >&2
+else
+  # Re-instantiate the whole agent-v0 layout as new tabs
+  # Each tab in agent-v0.kdl becomes one new tab here
+  zellij --config-dir "$CONFIG_DIR" action new-tab \
+    --layout-dir "$LAYOUT_DIR" \
+    --layout agent-v0 \
+    --name "restored-$(date +%H%M%S)" \
+    >/dev/null 2>&1 \
+    && echo "atrium-layout-restore: agent-v0 tabs re-added (close broken tabs with Ctrl+g t x)" \
+    || { echo "atrium-layout-restore: new-tab failed — try --nuke" >&2; exit 4; }
+fi
+
+"$TRACER" layout_restore only="${ONLY:-all}" >/dev/null 2>&1 || true

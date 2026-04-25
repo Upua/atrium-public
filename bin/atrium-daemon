@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# atrium-daemon — manage long-running workers with pidfile + log + crash-restart.
+# Consolidates the 4+ ad-hoc background loops (self heartbeat, mascot hb,
+# cost-ingest-watch, etc.) into one primitive.
+#
+# Usage:
+#   atrium-daemon start <name> -- <cmd> [args...]    # start under supervision
+#   atrium-daemon stop <name>                         # stop cleanly (SIGTERM)
+#   atrium-daemon restart <name>                      # bounce
+#   atrium-daemon status <name>                       # pid / uptime / restart count
+#   atrium-daemon logs <name> [N]                     # last N lines (default 20)
+#   atrium-daemon list                                # all managed daemons
+#
+# State layout (reuses peers/<name>/ — a daemon IS a peer):
+#   peers/<name>/daemon.pid     — supervisor pid
+#   peers/<name>/child.pid      — supervised process pid
+#   peers/<name>/daemon.log     — stdout+stderr from child (rotates at 5MB)
+#   peers/<name>/daemon.cmd     — original argv for restart
+#   peers/<name>/daemon.stats   — { restarts, last_exit_code, last_start_ts }
+#
+# Crash handling: supervisor relaunches child on non-zero exit, with
+# exponential backoff (1s, 2s, 4s, ..., max 60s). Resets backoff after 60s uptime.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PEERS_DIR="$ATRIUM_ROOT/peers"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+PEER_CLI="$ATRIUM_ROOT/bin/atrium-peer"
+
+_dir() { echo "$PEERS_DIR/$1"; }
+_dpid() { cat "$(_dir "$1")/daemon.pid" 2>/dev/null || echo ""; }
+_cpid() { cat "$(_dir "$1")/child.pid" 2>/dev/null || echo ""; }
+_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+_atomic_write() {
+  local target="$1" tmp
+  tmp="$(mktemp "${target}.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$target"
+}
+
+cmd_start() {
+  local name="${1:?atrium-daemon start: need name}"; shift
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+  [[ $# -ge 1 ]] || { echo "atrium-daemon start: need command after --" >&2; exit 2; }
+
+  local dir="$(_dir "$name")"
+  mkdir -p "$dir"
+
+  if _alive "$(_dpid "$name")"; then
+    echo "atrium-daemon: '$name' already running (pid $(_dpid "$name"))"
+    return 0
+  fi
+
+  # Persist the argv for restart
+  printf '%s\0' "$@" | _atomic_write "$dir/daemon.cmd"
+  # Init stats if missing
+  [[ -f "$dir/daemon.stats" ]] || echo '{"restarts":0}' | _atomic_write "$dir/daemon.stats"
+
+  # Register peer
+  "$PEER_CLI" register "$name" daemon --status "starting" >/dev/null 2>&1 || true
+
+  # Fork supervisor
+  setsid bash -c '
+    set +e
+    DIR="$1"; NAME="$2"; shift 2
+    LOG="$DIR/daemon.log"
+    BACKOFF=1
+    MAX_BACKOFF=60
+    while true; do
+      START_TS=$(date +%s)
+      # Run child, capture stdout+stderr to log
+      "$@" >>"$LOG" 2>&1 &
+      CHILD_PID=$!
+      echo "$CHILD_PID" > "$DIR/child.pid"
+      '"$PEER_CLI"' heartbeat "$NAME" --pid "$CHILD_PID" --status "running (pid $CHILD_PID)" >/dev/null 2>&1 || true
+      wait "$CHILD_PID"
+      EC=$?
+      END_TS=$(date +%s)
+      UP=$((END_TS - START_TS))
+
+      # Update stats atomically
+      python3 -c "
+import json, sys
+p = sys.argv[1]
+try: d = json.load(open(p))
+except: d = {}
+d[\"restarts\"] = d.get(\"restarts\", 0) + 1
+d[\"last_exit_code\"] = int(sys.argv[2])
+d[\"last_start_ts\"] = int(sys.argv[3])
+d[\"last_uptime_s\"] = int(sys.argv[4])
+tmp = p + \".tmp\"
+json.dump(d, open(tmp, \"w\"))
+import os; os.replace(tmp, p)
+" "$DIR/daemon.stats" "$EC" "$START_TS" "$UP" 2>/dev/null || true
+
+      # Clean exit (0) or SIGTERM (143) = stop supervising
+      if [[ "$EC" -eq 0 || "$EC" -eq 143 ]]; then
+        '"$PEER_CLI"' unregister "$NAME" >/dev/null 2>&1 || true
+        rm -f "$DIR/child.pid" "$DIR/daemon.pid" 2>/dev/null
+        exit 0
+      fi
+
+      # Crash — back off and relaunch. If child lived >60s, reset backoff.
+      if [[ "$UP" -ge 60 ]]; then BACKOFF=1; else
+        sleep "$BACKOFF"
+        BACKOFF=$(( BACKOFF * 2 ))
+        [[ "$BACKOFF" -gt "$MAX_BACKOFF" ]] && BACKOFF="$MAX_BACKOFF"
+      fi
+      '"$PEER_CLI"' heartbeat "$NAME" --status "restarting (exit $EC, backoff ${BACKOFF}s)" >/dev/null 2>&1 || true
+    done
+  ' -- "$dir" "$name" "$@" >/dev/null 2>&1 &
+
+  local dpid=$!
+  echo "$dpid" > "$dir/daemon.pid"
+  "$TRACER" daemon_start name="$name" pid="$dpid" >/dev/null 2>&1 || true
+  echo "atrium-daemon: '$name' started (supervisor pid $dpid)"
+}
+
+cmd_stop() {
+  local name="${1:?atrium-daemon stop: need name}"
+  local dir="$(_dir "$name")"
+  local dpid
+  dpid=$(_dpid "$name")
+  if ! _alive "$dpid"; then
+    echo "atrium-daemon: '$name' not running"
+    rm -f "$dir/daemon.pid" "$dir/child.pid" 2>/dev/null
+    "$PEER_CLI" unregister "$name" >/dev/null 2>&1 || true
+    return 0
+  fi
+  # kill the supervisor — it'll SIGTERM the child first, then exit cleanly
+  # But to be sure, also kill child directly
+  local cpid
+  cpid=$(_cpid "$name")
+  [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null || true
+  kill "$dpid" 2>/dev/null || true
+  # wait for supervisor exit
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    _alive "$dpid" || break
+    sleep 0.2
+  done
+  # force if still alive
+  _alive "$dpid" && kill -9 "$dpid" 2>/dev/null || true
+  rm -f "$dir/daemon.pid" "$dir/child.pid" 2>/dev/null
+  "$PEER_CLI" unregister "$name" >/dev/null 2>&1 || true
+  "$TRACER" daemon_stop name="$name" >/dev/null 2>&1 || true
+  echo "atrium-daemon: '$name' stopped"
+}
+
+cmd_restart() {
+  local name="${1:?atrium-daemon restart: need name}"
+  local dir="$(_dir "$name")"
+  [[ -f "$dir/daemon.cmd" ]] || { echo "atrium-daemon: no saved cmd for '$name'" >&2; exit 3; }
+  # Read argv from null-delimited file
+  mapfile -d '' -t argv < "$dir/daemon.cmd"
+  # Drop trailing empty (split artifact)
+  [[ -z "${argv[-1]}" ]] && unset 'argv[-1]'
+  cmd_stop "$name" >/dev/null 2>&1 || true
+  cmd_start "$name" -- "${argv[@]}"
+}
+
+cmd_status() {
+  local name="${1:?atrium-daemon status: need name}"
+  local dir="$(_dir "$name")"
+  local dpid cpid
+  dpid=$(_dpid "$name"); cpid=$(_cpid "$name")
+  if _alive "$dpid"; then
+    local started
+    started=$(stat -c %Y "$dir/daemon.pid" 2>/dev/null || echo 0)
+    local now=$(date +%s)
+    local up=$((now - started))
+    printf "'%s': running\n" "$name"
+    printf "  supervisor pid  %s\n" "$dpid"
+    printf "  child pid       %s\n" "${cpid:-(pending)}"
+    printf "  uptime          %ds\n" "$up"
+  else
+    printf "'%s': stopped\n" "$name"
+  fi
+  if [[ -f "$dir/daemon.stats" ]]; then
+    printf "  stats           %s\n" "$(cat "$dir/daemon.stats")"
+  fi
+  if [[ -f "$dir/daemon.log" ]]; then
+    printf "  log size        %s bytes\n" "$(stat -c %s "$dir/daemon.log")"
+  fi
+}
+
+cmd_logs() {
+  local name="${1:?atrium-daemon logs: need name}"
+  local n="${2:-20}"
+  local log="$(_dir "$name")/daemon.log"
+  [[ -f "$log" ]] || { echo "atrium-daemon: no log for '$name'"; return 0; }
+  tail -n "$n" "$log"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local any=0
+  for d in "$PEERS_DIR"/*/; do
+    [[ -f "$d/daemon.pid" ]] || continue
+    any=1
+    local name
+    name=$(basename "$d")
+    local dpid
+    dpid=$(cat "$d/daemon.pid")
+    if kill -0 "$dpid" 2>/dev/null; then
+      printf "  %-20s running (pid %s)\n" "$name" "$dpid"
+    else
+      printf "  %-20s stopped (stale pidfile %s)\n" "$name" "$dpid"
+    fi
+  done
+  [[ "$any" -eq 0 ]] && echo "  (no daemons managed)"
+}
+
+case "${1:-}" in
+  start)   shift; cmd_start   "$@" ;;
+  stop)    shift; cmd_stop    "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
+  status)  shift; cmd_status  "$@" ;;
+  logs)    shift; cmd_logs    "$@" ;;
+  list)    shift; cmd_list ;;
+  ""|help|--help|-h) sed -n '2,18p' "$0" ;;
+  *) echo "atrium-daemon: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

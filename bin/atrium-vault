@@ -1,0 +1,221 @@
+#!/usr/bin/env python3.11
+"""
+atrium-vault — terminal-side query over the operator's notes vault.
+
+The vault (set ATRIUM_VAULT_ROOT, default ~/Notes; reads from <vault>/Sessions/)
+is write-only until this primitive. Makes it readable from inside the workspace.
+
+Usage
+-----
+  atrium-vault list [--project P] [--since YYYY-MM-DD] [--tag T] [--limit N]
+  atrium-vault recent [N]                     # last N notes (default 10)
+  atrium-vault show <filename-fragment>       # cat a note (filename match)
+  atrium-vault search <text> [--limit N]      # grep across all notes
+  atrium-vault stats                          # counts by project / state / day
+
+Conventions
+-----------
+- Filenames are `YYYY-MM-DD-HH.MM-<project>.md` (with optional suffix).
+- Frontmatter fields read: date, project, state, auto_generated, tags.
+- Output is plain text, greppable, terminal-friendly.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+
+VAULT = Path(os.environ.get("ATRIUM_VAULT_ROOT", "~/Notes")).expanduser()
+SESSIONS = VAULT / "Sessions"
+
+FRONTMATTER_RE = re.compile(r"\A---\n(.+?)\n---\n", re.DOTALL)
+FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})\.(\d{2})-(.+)\.md$")
+
+
+def parse_frontmatter(text: str) -> dict:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    out = {}
+    for line in m.group(1).split("\n"):
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def iter_notes(sessions_dir=SESSIONS):
+    if not sessions_dir.is_dir():
+        return
+    for p in sorted(sessions_dir.iterdir(), reverse=True):
+        if p.suffix != ".md":
+            continue
+        yield p
+
+
+def note_meta(path: Path) -> dict:
+    """Fast metadata extraction — filename parse + frontmatter (first 1KB only)."""
+    meta = {"path": path, "name": path.name}
+    m = FILENAME_RE.match(path.name)
+    if m:
+        meta["date"] = m.group(1)
+        meta["time"] = f"{m.group(2)}:{m.group(3)}"
+        meta["project_fn"] = m.group(4)
+    try:
+        with path.open() as f:
+            head = f.read(1024)
+        meta.update(parse_frontmatter(head))
+    except Exception:
+        pass
+    return meta
+
+
+def cmd_list(args) -> int:
+    since = args.since and datetime.strptime(args.since, "%Y-%m-%d").date()
+    count = 0
+    for p in iter_notes():
+        m = note_meta(p)
+        if args.project and args.project.lower() not in (m.get("project", "") + " " + m.get("project_fn", "")).lower():
+            continue
+        if since:
+            try:
+                d = datetime.strptime(m.get("date", "1970-01-01"), "%Y-%m-%d").date()
+                if d < since:
+                    continue
+            except Exception:
+                continue
+        if args.tag:
+            tags = m.get("tags", "")
+            if args.tag.lower() not in tags.lower():
+                continue
+        state = m.get("state", "?")
+        proj = m.get("project", m.get("project_fn", "?"))
+        print(f"{m.get('date','?')} {m.get('time','?')}  [{state:<11}]  {proj:<24}  {p.name}")
+        count += 1
+        if count >= args.limit:
+            break
+    return 0
+
+
+def cmd_recent(args) -> int:
+    args_stub = argparse.Namespace(project=None, since=None, tag=None, limit=args.n)
+    return cmd_list(args_stub)
+
+
+def cmd_show(args) -> int:
+    frag = args.fragment.lower()
+    for p in iter_notes():
+        if frag in p.name.lower():
+            sys.stdout.write(p.read_text())
+            return 0
+    print(f"atrium-vault: no note matching {args.fragment!r}", file=sys.stderr)
+    return 3
+
+
+def cmd_search(args) -> int:
+    needle = args.text.lower()
+    hits = 0
+    for p in iter_notes():
+        try:
+            text = p.read_text(errors="replace")
+        except Exception:
+            continue
+        if needle in text.lower():
+            for line in text.splitlines():
+                if needle in line.lower():
+                    snippet = line.strip()[:140]
+                    m = FILENAME_RE.match(p.name)
+                    when = f"{m.group(1)} {m.group(2)}:{m.group(3)}" if m else "?"
+                    print(f"{when}  {p.name}: {snippet}")
+                    hits += 1
+                    break  # one hit per file
+        if hits >= args.limit:
+            break
+    if hits == 0:
+        print("(no matches)")
+    return 0
+
+
+def cmd_stats(args) -> int:
+    total = 0
+    by_project = Counter()
+    by_state = Counter()
+    by_day = Counter()
+    today = date.today()
+    recent_day = 0
+    recent_week = 0
+    for p in iter_notes():
+        total += 1
+        m = note_meta(p)
+        by_project[m.get("project", m.get("project_fn", "?"))] += 1
+        by_state[m.get("state", "?")] += 1
+        d_str = m.get("date", "")
+        by_day[d_str] += 1
+        try:
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            days = (today - d).days
+            if days == 0:
+                recent_day += 1
+            if 0 <= days < 7:
+                recent_week += 1
+        except Exception:
+            pass
+
+    print(f"total notes:       {total}")
+    print(f"today:             {recent_day}")
+    print(f"last 7 days:       {recent_week}")
+    print()
+    print("top projects (7d):")
+    # For 7d ranking we'd need to re-scan; just show all-time top 10 instead.
+    print("  (all-time, top 10)")
+    for proj, n in by_project.most_common(10):
+        print(f"    {n:>5}  {proj}")
+    print()
+    print("by state:")
+    for state, n in sorted(by_state.items(), key=lambda t: -t[1]):
+        print(f"  {n:>5}  {state}")
+    return 0
+
+
+def main() -> int:
+    if not VAULT.exists():
+        print(f"atrium-vault: vault not found at {VAULT}", file=sys.stderr)
+        return 2
+
+    ap = argparse.ArgumentParser(prog="atrium-vault", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser("list", help="filter + list notes")
+    p_list.add_argument("--project", help="substring match on project")
+    p_list.add_argument("--since", help="YYYY-MM-DD, notes on/after this date")
+    p_list.add_argument("--tag", help="substring match on tags")
+    p_list.add_argument("--limit", type=int, default=50)
+    p_list.set_defaults(fn=cmd_list)
+
+    p_rec = sub.add_parser("recent", help="last N notes (default 10)")
+    p_rec.add_argument("n", nargs="?", type=int, default=10)
+    p_rec.set_defaults(fn=cmd_recent)
+
+    p_show = sub.add_parser("show", help="print one note (filename fragment match)")
+    p_show.add_argument("fragment")
+    p_show.set_defaults(fn=cmd_show)
+
+    p_search = sub.add_parser("search", help="grep across all notes")
+    p_search.add_argument("text")
+    p_search.add_argument("--limit", type=int, default=30)
+    p_search.set_defaults(fn=cmd_search)
+
+    p_stats = sub.add_parser("stats", help="count + project/state breakdown")
+    p_stats.set_defaults(fn=cmd_stats)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

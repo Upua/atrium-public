@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# atrium-kill — fast-abort active commands in Atrium's zellij session.
+#
+# Sends Ctrl-C (byte 3) to every pane in the `atrium` zellij session,
+# interrupting any foreground process. Emits a `kill` event to trace.jsonl.
+#
+# Does NOT pkill the session itself — shells stay alive. For full teardown,
+# use `atrium --fresh` or `pkill -f "kitty.*--class atrium"` manually.
+#
+# Invoked by Super+Shift+Esc keybind or directly from terminal.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+ZELLIJ_DIR="$ATRIUM_ROOT/zellij"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+REASON="${1:-user}"
+
+# Log first so the kill event survives even if we fail below
+"$TRACER" kill reason="$REASON" >/dev/null 2>&1 || true
+
+# Is there an atrium session?
+if ! zellij --config-dir "$ZELLIJ_DIR" list-sessions --no-formatting 2>/dev/null | awk '{print $1}' | grep -Fxq "atrium"; then
+  echo "atrium-kill: no atrium session to kill" >&2
+  exit 0
+fi
+
+# Use zellij action to send Ctrl-C to the focused pane; iterate via focus-next-pane
+# to hit every pane in the current tab, then cycle tabs.
+#
+# Cheaper approach: use a plugin API / zellij pipe. But we don't have plugins yet.
+# For v0.1: just interrupt the focused pane — that's where the long-running
+# command usually is. Can extend to all-panes in v0.2 when we have a plugin
+# that can iterate safely.
+
+zellij --config-dir "$ZELLIJ_DIR" action write 3 2>/dev/null || true
+echo "atrium-kill: SIGINT sent to focused pane in 'atrium' session (reason: $REASON)"

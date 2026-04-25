@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# atrium-self — register the orchestrator (me, Claude) as a peer.
+#
+# Makes the roster reflect reality. Without this, atrium-peer-panel is
+# theater — it lists subagents but not the main agent driving them.
+#
+# Usage:
+#   atrium-self start "<initial status>"   # register + start heartbeat loop
+#   atrium-self status                      # read: print running state + heartbeat + status.md
+#   atrium-self status "<line>"            # write: update status + heartbeat
+#   atrium-self stop                        # unregister, stop heartbeat loop
+#   atrium-self is-running                  # 0 if live, non-zero otherwise
+#
+# Peer name is "claude" by default (override with $ATRIUM_SELF_NAME).
+# Heartbeat loop: updates every 20s in background until stopped.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+SELF_NAME="${ATRIUM_SELF_NAME:-claude}"
+PEER_DIR="$ATRIUM_ROOT/peers/$SELF_NAME"
+HB_PIDFILE="$PEER_DIR/hb.pid"
+PEER_CLI="$ATRIUM_ROOT/bin/atrium-peer"
+
+_is_running() {
+  [[ -f "$HB_PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$HB_PIDFILE" 2>/dev/null || echo "")
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_start() {
+  local status="${1:-working}"
+  if _is_running; then
+    # already running — just update status
+    "$PEER_CLI" heartbeat "$SELF_NAME" --status "$status"
+    return 0
+  fi
+
+  mkdir -p "$PEER_DIR"
+  "$PEER_CLI" register "$SELF_NAME" agent --status "$status"
+
+  # Background heartbeat loop — writes heartbeat every 20s while PPID alive
+  (
+    while [[ -f "$HB_PIDFILE" ]]; do
+      sleep 20
+      "$PEER_CLI" heartbeat "$SELF_NAME" 2>/dev/null || break
+    done
+  ) &
+  echo "$!" > "$HB_PIDFILE"
+  echo "atrium-self: registered as '$SELF_NAME' (hb loop pid $!)"
+}
+
+cmd_status() {
+  # No arg → read path: print running state + heartbeat + status text.
+  if [[ $# -eq 0 ]]; then
+    if _is_running; then
+      echo "running (hb pid $(cat "$HB_PIDFILE"))"
+    else
+      echo "not running"
+    fi
+    [[ -f "$PEER_DIR/heartbeat.json" ]] && { echo "--- heartbeat.json"; cat "$PEER_DIR/heartbeat.json"; echo; }
+    [[ -f "$PEER_DIR/status.md"     ]] && { echo "--- status.md";      cat "$PEER_DIR/status.md"; }
+    return 0
+  fi
+
+  # With arg → write path: update heartbeat status line.
+  local line="$1"
+  if ! _is_running && [[ ! -d "$PEER_DIR" ]]; then
+    # auto-start if nobody started us yet
+    cmd_start "$line"
+    return 0
+  fi
+  "$PEER_CLI" heartbeat "$SELF_NAME" --status "$line" 2>/dev/null || {
+    # peer dir missing — re-register
+    cmd_start "$line"
+  }
+}
+
+cmd_stop() {
+  if _is_running; then
+    local pid
+    pid=$(cat "$HB_PIDFILE")
+    kill "$pid" 2>/dev/null || true
+    rm -f "$HB_PIDFILE"
+  fi
+  "$PEER_CLI" unregister "$SELF_NAME" 2>/dev/null || true
+  echo "atrium-self: unregistered '$SELF_NAME'"
+}
+
+cmd_is_running() {
+  if _is_running; then exit 0; else exit 1; fi
+}
+
+case "${1:-}" in
+  start)      shift; cmd_start      "${1:-working}" ;;
+  status)     shift; cmd_status     "$@" ;;
+  stop)       shift; cmd_stop ;;
+  is-running) shift; cmd_is_running ;;
+  ""|help|--help|-h) sed -n '2,14p' "$0" ;;
+  *) echo "atrium-self: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

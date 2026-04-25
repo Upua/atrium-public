@@ -1,0 +1,13 @@
+# Privacy gate for graphify extraction.
+# graphify does NOT honor file mode (0600). This file is the ONLY block.
+# Mirror what chmod 0600 protects: private handoffs, claims, missions, walkthroughs.
+
+claim.md
+handoff.md
+handoff-*.md
+mission.md
+walkthrough.md
+
+# Decisions subdir — two private entries (keep the 0664 decisions available)
+decisions/2026-04-20-hud-honesty-audit.md
+decisions/2026-04-20-seed-v07-cognitive-verb-consolidation.md

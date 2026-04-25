@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# atrium-mascot — ambient mascot as a peer Kitty OS-window.
+#
+# First test of the "graphics surfaces live in peer Kitty windows, not
+# nested inside Zellij panes" architecture (per PATTERNS). Reuses the
+# existing ~/.claude/scripts/mascot-render.py — it's already built, tested,
+# and reads cockpit-state.json for mode.
+#
+# Usage:
+#   atrium-mascot spawn    — open the mascot window, register peer
+#   atrium-mascot stop     — close the window, unregister
+#   atrium-mascot status   — running / not
+#
+# Window class: atrium-mascot (so WM can style it distinctly from Atrium
+# itself — e.g. pin to a corner later via Hyprland rules in v0.3+).
+#
+# Peer: "mascot", role "ambient". Heartbeat refreshed every 20s by a
+# background loop while the kitty window is alive.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PEER_DIR="$ATRIUM_ROOT/peers/mascot"
+PIDFILE="$PEER_DIR/kitty.pid"
+HB_PIDFILE="$PEER_DIR/hb.pid"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+PEER_CLI="$ATRIUM_ROOT/bin/atrium-peer"
+
+MASCOT_SCRIPT="$HOME/.claude/scripts/mascot-render.py"
+
+case ":${PATH:-}:" in
+  *:"$HOME/.local/bin":*) ;;
+  *) export PATH="$HOME/.local/bin:${PATH:-}" ;;
+esac
+
+_is_running() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null || echo "")
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_spawn() {
+  if _is_running; then
+    echo "atrium-mascot: already running (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+  [[ -f "$MASCOT_SCRIPT" ]] || { echo "atrium-mascot: missing $MASCOT_SCRIPT" >&2; exit 1; }
+
+  mkdir -p "$PEER_DIR"
+
+  # Spawn a dedicated kitty OS-window. --detach so it's independent; small size;
+  # own class so WM can rule on it later. Run mascot-render.py inside.
+  kitty --detach \
+        --class atrium-mascot \
+        --title "Atrium · Hex" \
+        --override "initial_window_width=280" \
+        --override "initial_window_height=180" \
+        --override "hide_window_decorations=no" \
+        --override "background_opacity=1.0" \
+        --override "window_padding_width=4" \
+        --override "remember_window_size=no" \
+        -- python3 "$MASCOT_SCRIPT"
+
+  # Find the kitty PID (most recent kitty with --class atrium-mascot)
+  sleep 0.5
+  local pid
+  pid=$(pgrep -f "kitty.*--class atrium-mascot" | head -1 || echo "")
+  if [[ -z "$pid" ]]; then
+    echo "atrium-mascot: kitty didn't start" >&2
+    exit 1
+  fi
+  echo "$pid" > "$PIDFILE"
+
+  "$PEER_CLI" register mascot ambient --pid "$pid" --status "kitty OS-window · Hex live"
+  "$TRACER" peer_mascot_spawn pid="$pid" >/dev/null 2>&1 || true
+
+  # Background heartbeat loop — refresh peer heartbeat every 20s while kitty lives
+  (
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 20
+      [[ -f "$PIDFILE" ]] || break
+      "$PEER_CLI" heartbeat mascot --pid "$pid" 2>/dev/null || break
+    done
+    # kitty exited — unregister
+    "$PEER_CLI" unregister mascot 2>/dev/null || true
+    rm -f "$PIDFILE" "$HB_PIDFILE" 2>/dev/null || true
+  ) &
+  echo "$!" > "$HB_PIDFILE"
+
+  echo "atrium-mascot: spawned (kitty pid $pid, hb loop pid $(cat "$HB_PIDFILE"))"
+}
+
+cmd_stop() {
+  if ! _is_running; then
+    echo "atrium-mascot: not running"
+    "$PEER_CLI" unregister mascot 2>/dev/null || true
+    rm -f "$PIDFILE" "$HB_PIDFILE" 2>/dev/null
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PIDFILE")
+  # kill the heartbeat loop first so it doesn't re-register
+  if [[ -f "$HB_PIDFILE" ]]; then
+    kill "$(cat "$HB_PIDFILE")" 2>/dev/null || true
+  fi
+  # kill kitty
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  "$PEER_CLI" unregister mascot 2>/dev/null || true
+  rm -f "$PIDFILE" "$HB_PIDFILE" 2>/dev/null
+  "$TRACER" peer_mascot_stop pid="$pid" >/dev/null 2>&1 || true
+  echo "atrium-mascot: stopped (pid $pid)"
+}
+
+cmd_status() {
+  if _is_running; then
+    echo "running — kitty pid $(cat "$PIDFILE")"
+  else
+    echo "not running"
+  fi
+}
+
+case "${1:-}" in
+  spawn)  shift; cmd_spawn  "$@" ;;
+  stop)   shift; cmd_stop   "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  ""|help|--help|-h) sed -n '2,16p' "$0" ;;
+  *) echo "atrium-mascot: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

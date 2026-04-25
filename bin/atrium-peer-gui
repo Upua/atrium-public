@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# atrium-peer-gui — bridge a GUI-bound agent into Atrium's peer model.
+#
+# Today this supports one agent mapping — "gemini" running in an external GUI agent (e.g. another assistant)
+# Agent Manager + reachable via the Petri channel. The shape is factored so
+# other GUI-agents can be added by extending the SEND/WAIT blocks below;
+# nothing here assumes the GUI agent specifically except the window-title
+# match and the Petri-channel wait path.
+#
+# Usage:
+#   atrium-peer-gui <agent> "<prompt>" [--timeout <sec>] [--no-wait]
+#   atrium-peer-gui gemini "prompt text here"           # wait up to 300s for reply
+#   atrium-peer-gui gemini "..." --no-wait              # fire-and-forget
+#   atrium-peer-gui gemini "..." --timeout 120          # custom timeout
+#
+# On success (reply received): prints the agent's reply to stdout, exit 0.
+# On timeout: prints what we have + "(timeout after Ns)" to stderr, exit 4.
+# On unknown agent: exit 2 with usage hint.
+#
+# Requires: xdotool, wmctrl (for window focus), python3, Petri installed.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+AGENT=""
+PROMPT=""
+TIMEOUT=300
+NO_WAIT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --no-wait) NO_WAIT=1; shift ;;
+    --help|-h) sed -n '2,20p' "$0"; exit 0 ;;
+    -*) echo "atrium-peer-gui: unknown flag: $1" >&2; exit 2 ;;
+    *)  if [[ -z "$AGENT" ]]; then AGENT="$1"
+        elif [[ -z "$PROMPT" ]]; then PROMPT="$1"
+        else echo "atrium-peer-gui: extra arg: $1" >&2; exit 2
+        fi
+        shift ;;
+  esac
+done
+
+[[ -n "$AGENT" && -n "$PROMPT" ]] || {
+  echo "Usage: atrium-peer-gui <agent> \"<prompt>\" [--timeout N] [--no-wait]" >&2
+  exit 2
+}
+
+case "$AGENT" in
+  gemini)
+    WINDOW_TITLE="Manager"           # GUI agent window title (configure for your setup)
+    PETRI_DIR="${PETRI_CHANNEL_DIR:-$HOME/petri-channel}"
+    ;;
+  *)
+    echo "atrium-peer-gui: agent '$AGENT' not wired. Supported: gemini" >&2
+    echo "  (add a case block above to extend to new GUI-agents)" >&2
+    exit 2
+    ;;
+esac
+
+# --- Step 1: deliver the prompt to the agent's channel ---
+if [[ "$AGENT" == "gemini" ]]; then
+  python3 - "$PETRI_DIR" "$PROMPT" <<'PY' >/dev/null
+import sys, os
+sys.path.insert(0, sys.argv[1])
+from petri_protocol import PetriAgent
+sender = os.environ.get("PETRI_AGENT", "claude")
+a = PetriAgent(sender, sys.argv[1])
+a.send(sys.argv[2], msg_type="query")
+PY
+
+  CHANNEL="$PETRI_DIR/channel.jsonl"
+  BASELINE=$(wc -l < "$CHANNEL")
+
+  if ! xdotool search --name "$WINDOW_TITLE" windowactivate --sync 2>/dev/null; then
+    echo "atrium-peer-gui: could not focus '$WINDOW_TITLE' window" >&2
+    exit 3
+  fi
+  xdotool key ctrl+l
+  sleep 0.15
+  xdotool type --delay 6 "New message on channel.jsonl from ${PETRI_AGENT:-claude}. Read and respond."
+  xdotool key Return
+fi
+
+"$TRACER" peer_gui_send agent="$AGENT" prompt_len="${#PROMPT}" >/dev/null 2>&1 || true
+
+if [[ $NO_WAIT -eq 1 ]]; then
+  echo "sent (no-wait) to $AGENT"
+  exit 0
+fi
+
+# --- Step 2: wait for the agent's reply ---
+if [[ "$AGENT" == "gemini" ]]; then
+  START=$(date +%s)
+  REPLY=""
+  while :; do
+    NOW=$(date +%s)
+    ELAPSED=$(( NOW - START ))
+    if (( ELAPSED >= TIMEOUT )); then
+      echo "atrium-peer-gui: timeout after ${TIMEOUT}s waiting for $AGENT reply" >&2
+      "$TRACER" peer_gui_timeout agent="$AGENT" timeout="$TIMEOUT" >/dev/null 2>&1 || true
+      exit 4
+    fi
+    CUR=$(wc -l < "$CHANNEL")
+    if (( CUR > BASELINE )); then
+      REPLY=$(python3 - "$CHANNEL" "$BASELINE" "$AGENT" <<'PY'
+import sys, json
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+baseline = int(sys.argv[2])
+agent = sys.argv[3]
+for line in reversed(lines[baseline:]):
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get("sender") == agent:
+        print(d.get("content", ""))
+        sys.exit(0)
+sys.exit(1)
+PY
+      ) && break || true
+    fi
+    sleep 2
+  done
+  echo "$REPLY"
+  "$TRACER" peer_gui_reply agent="$AGENT" bytes="${#REPLY}" elapsed_s="$ELAPSED" >/dev/null 2>&1 || true
+fi

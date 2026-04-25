@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# atrium-diff-view — open a dedicated Kitty peer window showing a rendered diff.
+#
+# Uses `delta` for the rendering (already installed, syntax-highlighted, with
+# the oxidized-copper palette inheriting from kitty.conf colors). The window is
+# a peer Kitty OS-window (--class atrium-diff) — a first real test of the
+# "graphics in peer windows, not Zellij panes" architecture for work, not
+# decoration.
+#
+# Usage:
+#   atrium-diff-view                        # last commit (HEAD)
+#   atrium-diff-view <sha>                  # specific commit
+#   atrium-diff-view --staged               # currently staged changes
+#   atrium-diff-view --range <a>..<b>       # range
+#   atrium-diff-view --repo <path>          # diff a different repo
+#
+# The window is registered as peer "diff-view" while alive; closes on any
+# keypress (q or Enter both work via less +q). Traces open + close.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+PEER_CLI="$ATRIUM_ROOT/bin/atrium-peer"
+KITTY_CONF="$ATRIUM_ROOT/kitty/kitty.conf"
+
+REPO="$PWD"
+TARGET=""
+STAGED=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --staged) STAGED=1; shift ;;
+    --repo)   REPO="$2"; shift 2 ;;
+    --range)  TARGET="$2"; shift 2 ;;
+    --help|-h) sed -n '2,15p' "$0"; exit 0 ;;
+    -*) echo "atrium-diff-view: unknown flag: $1" >&2; exit 2 ;;
+    *)  TARGET="$1"; shift ;;
+  esac
+done
+
+[[ -d "$REPO/.git" ]] || { echo "atrium-diff-view: not a git repo: $REPO" >&2; exit 3; }
+
+# Build the diff command
+if [[ "$STAGED" -eq 1 ]]; then
+  DIFF_CMD="git -C $REPO diff --staged"
+  LABEL="staged"
+elif [[ -n "$TARGET" ]]; then
+  DIFF_CMD="git -C $REPO show --stat --patch $TARGET"
+  LABEL="$TARGET"
+else
+  DIFF_CMD="git -C $REPO show --stat --patch HEAD"
+  LABEL="HEAD"
+fi
+
+# Register peer + trace
+"$PEER_CLI" register diff-view reviewer --status "showing: $LABEL" >/dev/null 2>&1 || true
+"$TRACER" peer_diff_open label="$LABEL" repo="$REPO" >/dev/null 2>&1 || true
+
+# Spawn peer Kitty window. Kitty detaches, runs delta in a pager that quits
+# on q, then the window closes. We unregister the peer after kitty exits.
+#
+# Note: using --hold so the window survives until user dismisses. delta pipes
+# into `less -R` by default when stdout is a tty.
+
+kitty --detach \
+      --class atrium-diff \
+      --title "Atrium · diff · $LABEL" \
+      --config "$KITTY_CONF" \
+      --override "initial_window_width=1200" \
+      --override "initial_window_height=900" \
+      -- bash -lc "$DIFF_CMD | delta --paging=always --line-numbers --features=line-numbers; echo; echo '[press q to close]'; read -n 1 -s"
+
+# After the window spawns (detached), we don't know when it closes without
+# tracking the pid. Simpler: schedule an unregister via background watcher.
+(
+  sleep 0.5
+  # Track the new atrium-diff kitty by class
+  while pgrep -f "kitty.*--class atrium-diff" >/dev/null 2>&1; do
+    sleep 2
+  done
+  "$PEER_CLI" unregister diff-view >/dev/null 2>&1 || true
+  "$TRACER" peer_diff_close label="$LABEL" >/dev/null 2>&1 || true
+) &
+
+echo "atrium-diff-view: opened '$LABEL' (Kitty peer window --class atrium-diff)"

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# atrium-decide — log a non-trivial decision in brain/decisions/.
+#
+# Usage:
+#   atrium-decide "<title>"                # creates brain/decisions/<date>-<slug>.md from template, prints path
+#   atrium-decide list                     # lists all decisions, most recent first
+#   atrium-decide read <slug|number>       # prints a specific decision (match by slug or 1-based index)
+#
+# Template fields: Context, Options, Choice, Why, Reversibility, Follow-ups.
+# Non-trivial = "if a future-me asks why we did this, they'd want this doc."
+# Trivial fixes don't go here — those live in commit messages.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+DEC_DIR="$ATRIUM_ROOT/brain/decisions"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+mkdir -p "$DEC_DIR"
+
+_slug() {
+  # lower, spaces → hyphens, strip non-[a-z0-9-], squeeze repeats, trim
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | \
+    sed 's/[^a-z0-9-]//g; s/-\+/-/g; s/^-//; s/-$//'
+}
+
+case "${1:-}" in
+  list)
+    if compgen -G "$DEC_DIR/*.md" >/dev/null; then
+      ls -1t "$DEC_DIR"/*.md | while read -r f; do
+        printf "  %s\n" "$(basename "$f" .md)"
+      done
+    else
+      echo "  (no decisions logged yet — atrium-decide \"<title>\" starts one)"
+    fi
+    ;;
+  read)
+    [[ -n "${2:-}" ]] || { echo "atrium-decide read: need slug or index" >&2; exit 2; }
+    target=""
+    if [[ "$2" =~ ^[0-9]+$ ]]; then
+      target=$(ls -1t "$DEC_DIR"/*.md 2>/dev/null | sed -n "${2}p")
+    else
+      target=$(ls -1 "$DEC_DIR"/*"$2"*.md 2>/dev/null | head -1)
+    fi
+    [[ -n "$target" && -f "$target" ]] || { echo "atrium-decide read: no match for '$2'" >&2; exit 3; }
+    cat "$target"
+    ;;
+  --help|-h|"")
+    sed -n '2,12p' "$0"
+    exit 0
+    ;;
+  *)
+    title="$*"
+    slug=$(_slug "$title")
+    [[ -n "$slug" ]] || { echo "atrium-decide: title produced empty slug" >&2; exit 2; }
+    date_str=$(date +%Y-%m-%d)
+    path="$DEC_DIR/${date_str}-${slug}.md"
+    if [[ -e "$path" ]]; then
+      echo "atrium-decide: exists: $path" >&2
+      echo "$path"
+      exit 0
+    fi
+    cat > "$path" <<TEMPLATE
+# Decision: $title
+
+**Date:** $date_str
+**Logged by:** ${ATRIUM_PEER:-claude}
+
+## Context
+<what prompted this decision — the question you faced>
+
+## Options
+<the alternatives you weighed, briefly>
+
+## Choice
+<what you picked>
+
+## Why
+<the one-sentence rationale a future-you needs to not re-argue this>
+
+## Reversibility
+<how hard is it to undo — minutes, hours, or architectural>
+
+## Follow-ups
+<any next-actions this unblocks or spawns>
+TEMPLATE
+    "$TRACER" decide title="$title" path="$path" >/dev/null 2>&1 || true
+    echo "decided: $path"
+    ;;
+esac

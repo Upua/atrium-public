@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# atrium-write — full-file overwrite (creates if missing) with atomicity + tracing.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_write"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-write' is now a cognitive verb. Consider using 'atrium write' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+GUARD="$ATRIUM_ROOT/bin/atrium-guard"
+
+if [[ $# -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
+  echo "Usage: atrium-write <absolute-path> [content]"
+  echo "       echo 'content' | atrium-write <absolute-path>"
+  exit 0
+fi
+
+TARGET="$1"
+shift
+
+if [[ "$TARGET" != /* ]]; then
+  echo "atrium-write: error: path must be absolute ($TARGET)" >&2
+  exit 1
+fi
+
+"$GUARD" check "atrium-write $TARGET"
+
+mkdir -p "$(dirname "$TARGET")"
+TMP="$(mktemp "${TARGET}.XXXXXX")"
+
+if [[ $# -gt 0 ]]; then
+  printf "%s\n" "$*" > "$TMP"
+else
+  cat > "$TMP"
+fi
+
+mv "$TMP" "$TARGET"
+
+BYTES=$(wc -c < "$TARGET")
+echo "wrote: $TARGET (${BYTES}b)"
+"$TRACER" fs_write path="$TARGET" bytes="$BYTES"

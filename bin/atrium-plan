@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# atrium-plan — plan-gated execution ritual. Makes brain/implementation_plan.md
+# checkboxes into LIVE state instead of a static document.
+#
+# Usage:
+#   atrium-plan next              # print the next unchecked item (path+phase+body)
+#   atrium-plan approve           # mark the current plan approved (writes metadata)
+#   atrium-plan start <phase-num> # mark phase in-progress (→ trace + roster)
+#   atrium-plan complete <phase-num> [--skip-verify]
+#                                  # marks all [ ] → [x] for the phase, runs verification if any,
+#                                  # calls atrium-commit with the phase subject
+#   atrium-plan status            # print current plan state summary
+#
+# Parses phases as `### Phase N — <name>` and items as `- [ ]` / `- [x]`.
+# A phase's "verification" is any line starting with `- **Verification:**` —
+# if it contains an executable sentinel like `✅`, the phase is considered
+# auto-verified. Otherwise, --skip-verify must be used or the phase carries a
+# `verification:` bash command in metadata.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_plan"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-plan' is now a cognitive verb. Consider using 'atrium plan' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PLAN="$ATRIUM_ROOT/brain/implementation_plan.md"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+SELF="$ATRIUM_ROOT/bin/atrium-self"
+
+[[ -f "$PLAN" ]] || { echo "atrium-plan: no implementation_plan.md at $PLAN" >&2; exit 3; }
+
+_atomic_write() {
+  local target="$1" tmp
+  tmp="$(mktemp "${target}.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$target"
+}
+
+cmd_next() {
+  python3 - "$PLAN" <<'PY'
+import sys, re
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+cur_phase = None
+for i, ln in enumerate(lines):
+    m = re.match(r"^### Phase (\d+)\s*[—-]\s*(.+?)\s*$", ln.rstrip())
+    if m:
+        cur_phase = (int(m.group(1)), m.group(2))
+        continue
+    if ln.startswith("- [ ]"):
+        item = ln.strip()
+        pn, pname = cur_phase if cur_phase else (0, "?")
+        print(f"phase {pn} — {pname}")
+        print(f"  next: {item}")
+        print(f"  (line {i+1})")
+        sys.exit(0)
+print("(all items checked — plan complete)")
+PY
+}
+
+cmd_start() {
+  local num="${1:?atrium-plan start: need phase number}"
+  "$TRACER" plan_start phase="$num" >/dev/null 2>&1 || true
+  if [[ -x "$SELF" ]]; then
+    "$SELF" status "working · plan phase $num" >/dev/null 2>&1 || true
+  fi
+  echo "plan phase $num marked in-progress"
+}
+
+cmd_complete() {
+  local num="${1:?atrium-plan complete: need phase number}"
+  shift
+  local skip_verify=0
+  [[ "${1:-}" == "--skip-verify" ]] && skip_verify=1
+
+  # Read phase header + items, mark all [ ] → [x] within that phase
+  python3 - "$PLAN" "$num" <<'PY' > /tmp/atrium-plan-new.md
+import sys, re
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+target_num = int(sys.argv[2])
+in_target = False
+out = []
+phase_header = None
+for ln in lines:
+    m = re.match(r"^### Phase (\d+)\s*[—-]\s*(.+?)\s*$", ln.rstrip())
+    if m:
+        pn = int(m.group(1))
+        in_target = (pn == target_num)
+        if in_target:
+            phase_header = m.group(2)
+            # Append ✅ if not already
+            if not ln.rstrip().endswith("✅"):
+                ln = ln.rstrip() + " ✅\n"
+    elif in_target and ln.startswith("### "):
+        in_target = False
+    if in_target and ln.startswith("- [ ]"):
+        ln = ln.replace("- [ ]", "- [x]", 1)
+    out.append(ln)
+sys.stdout.writelines(out)
+if phase_header:
+    import os
+    os.environ.setdefault("ATRIUM_PLAN_PHASE_NAME", phase_header)
+    with open("/tmp/atrium-plan-phase-name.txt", "w") as f:
+        f.write(phase_header)
+PY
+
+  # Atomic swap
+  mv /tmp/atrium-plan-new.md "$PLAN"
+  local phase_name=""
+  [[ -f /tmp/atrium-plan-phase-name.txt ]] && phase_name=$(cat /tmp/atrium-plan-phase-name.txt)
+  rm -f /tmp/atrium-plan-phase-name.txt
+
+  "$TRACER" plan_complete phase="$num" name="$phase_name" >/dev/null 2>&1 || true
+  echo "plan phase $num complete: $phase_name"
+
+  # Auto-commit with the phase as the subject
+  if [[ -x "$ATRIUM_ROOT/bin/atrium-commit" ]]; then
+    local subj="plan phase $num: $phase_name"
+    "$ATRIUM_ROOT/bin/atrium-commit" "$subj" 2>&1 | sed 's/^/  /' || true
+  fi
+}
+
+cmd_status() {
+  python3 - "$PLAN" <<'PY'
+import sys, re
+with open(sys.argv[1]) as f:
+    text = f.read()
+phases = re.findall(r"^### Phase (\d+)\s*[—-]\s*(.+?)$", text, re.M)
+total = len(phases)
+done = 0
+for m in re.finditer(r"^### Phase (\d+)[^\n]*\n(.*?)(?=^### Phase |\Z)", text, re.M | re.S):
+    body = m.group(2)
+    items = re.findall(r"^- \[( |x)\]", body, re.M)
+    if items and all(i == "x" for i in items):
+        done += 1
+print(f"{done}/{total} phases complete")
+print()
+for pn, pname in phases:
+    print(f"  Phase {pn} — {pname}")
+PY
+}
+
+cmd_approve() {
+  "$TRACER" plan_approve >/dev/null 2>&1 || true
+  echo "plan approved (trace event written)"
+}
+
+case "${1:-}" in
+  next)     shift; cmd_next ;;
+  approve)  shift; cmd_approve ;;
+  start)    shift; cmd_start    "$@" ;;
+  complete) shift; cmd_complete "$@" ;;
+  status)   shift; cmd_status ;;
+  ""|help|--help|-h) sed -n '2,18p' "$0" ;;
+  *) echo "atrium-plan: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

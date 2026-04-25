@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# atrium-recall — lexical + semantic search over Atrium's memory surfaces.
+#
+# Usage:
+#   atrium-recall "<query>"                # lexical: brain/ + trace.jsonl + git log
+#   atrium-recall --semantic "<query>"     # semantic: Cortex embeddings across all source_tables
+#   atrium-recall -s --limit 12 "<query>"  # semantic with custom top-k
+#   atrium-recall --brain "<query>"        # only brain/ (lexical)
+#   atrium-recall --trace "<query>"        # only trace.jsonl (lexical)
+#   atrium-recall --git "<query>"          # only git log messages (lexical)
+#
+# Semantic backend uses `atrium-embed-source query-all` — delegates to Cortex's
+# MiniLM-L6-v2 embeddings. Cross-source ranking by cosine similarity.
+# Falls back silently if the helper is missing.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+BRAIN="$ATRIUM_ROOT/brain"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+SCOPE="all"
+QUERY=""
+SEMANTIC=0
+SEM_LIMIT=8
+FEEDBACK_MODE=""
+
+# feedback subcommand short-circuit — no query needed
+if [[ "${1:-}" == "feedback" ]]; then
+  FEEDBACK_MODE="${2:-summary}"
+  python3 - "$FEEDBACK_MODE" <<'PY'
+import sys, os, time
+sys.path.insert(0, os.path.expanduser("~/.claude/scripts"))
+try:
+    import recall_feedback as rf
+except Exception as e:
+    print(f"atrium-recall feedback: recall_feedback module not loadable: {e}", file=sys.stderr)
+    sys.exit(2)
+
+mode = sys.argv[1] if len(sys.argv) > 1 else "summary"
+s = rf.summary()
+if not s.get("exists"):
+    print(f"feedback DB not yet created at {s['db']}")
+    print("  (will auto-create on first surface logged from memory-surface.sh)")
+    sys.exit(0)
+
+if mode in ("summary", "stats"):
+    print(f"surfaces logged:   {s['surfaces_total']}")
+    print(f"scored memories:   {s['scored_memories']}")
+    print(f"useful credits:    {s['total_useful_credits']}")
+    print(f"ignored credits:   {s['total_ignored_credits']}")
+    if s['total_useful_credits'] + s['total_ignored_credits'] > 0:
+        ratio = s['total_useful_credits'] / (s['total_useful_credits'] + s['total_ignored_credits'])
+        print(f"useful ratio:      {ratio:.1%}")
+
+elif mode == "useful":
+    print("Top useful memories:")
+    print(f"{'score':<8}  {'src:id':<32}  u  i  last")
+    for r in rf.top_useful(20):
+        d = dict(r)
+        mult = rf.multiplier_from(d['useful_count'], d['ignored_count'])
+        last = time.strftime("%Y-%m-%d", time.localtime(d['last_seen_ts'])) if d['last_seen_ts'] else "?"
+        src_id = f"{d['source_table']}:{d['source_id']}"
+        print(f"{mult:.3f}     {src_id:<32}  {d['useful_count']:<2} {d['ignored_count']:<2} {last}")
+
+elif mode == "ignored":
+    print("Top ignored memories (>=3 ignored, 0 useful):")
+    print(f"{'score':<8}  {'src:id':<32}  u  i  last")
+    for r in rf.top_ignored(20):
+        d = dict(r)
+        mult = rf.multiplier_from(d['useful_count'], d['ignored_count'])
+        last = time.strftime("%Y-%m-%d", time.localtime(d['last_seen_ts'])) if d['last_seen_ts'] else "?"
+        src_id = f"{d['source_table']}:{d['source_id']}"
+        print(f"{mult:.3f}     {src_id:<32}  {d['useful_count']:<2} {d['ignored_count']:<2} {last}")
+
+elif mode == "recent":
+    print("Recent surfaces:")
+    print(f"{'when':<20}  {'src:id':<34}  preview")
+    for r in rf.recent_surfaces(20):
+        d = dict(r)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(d['ts']))
+        src_id = f"{d['source_table']}:{d['source_id']}"
+        print(f"{when}  {src_id:<34}  {d['preview_short'][:80]}")
+
+else:
+    print(f"atrium-recall feedback: unknown mode {mode!r}", file=sys.stderr)
+    print("Modes: summary | useful | ignored | recent")
+    sys.exit(2)
+PY
+  exit $?
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --brain) SCOPE="brain"; shift ;;
+    --trace) SCOPE="trace"; shift ;;
+    --git)   SCOPE="git"; shift ;;
+    --semantic|-s) SEMANTIC=1; shift ;;
+    --limit) SEM_LIMIT="$2"; shift 2 ;;
+    --help|-h) sed -n '2,13p' "$0"; exit 0 ;;
+    *) QUERY="${QUERY:+$QUERY }$1"; shift ;;
+  esac
+done
+
+[[ -n "$QUERY" ]] || { echo "atrium-recall: need a query (or 'atrium-recall feedback [summary|useful|ignored|recent]')" >&2; exit 2; }
+
+hits=0
+
+_search_brain() {
+  if [[ -d "$BRAIN" ]]; then
+    echo "=== brain/ ==="
+    if /usr/bin/grep -rinI --color=never "$QUERY" "$BRAIN" 2>/dev/null | head -40; then
+      hits=$((hits+1))
+    else
+      echo "  (no matches)"
+    fi
+    echo ""
+  fi
+}
+
+_search_trace() {
+  if [[ -f "$TRACE" ]]; then
+    echo "=== state/trace.jsonl ==="
+    if /usr/bin/grep -i --color=never "$QUERY" "$TRACE" 2>/dev/null | tail -20; then
+      hits=$((hits+1))
+    else
+      echo "  (no matches)"
+    fi
+    echo ""
+  fi
+}
+
+_search_git() {
+  if [[ -d "$ATRIUM_ROOT/.git" ]]; then
+    echo "=== git log (subject + body) ==="
+    if git -C "$ATRIUM_ROOT" log --all --oneline --grep="$QUERY" -i 2>/dev/null | head -20 | grep .; then
+      hits=$((hits+1))
+    else
+      echo "  (no matches)"
+    fi
+    echo ""
+  fi
+}
+
+_search_semantic() {
+  local helper="$ATRIUM_ROOT/bin/atrium-embed-source"
+  if [[ ! -x "$helper" ]]; then
+    echo "=== semantic (unavailable) ==="
+    echo "  atrium-embed-source not found — falling back to lexical only"
+    echo ""
+    return
+  fi
+  echo "=== semantic (cortex embeddings, cross-source) ==="
+  "$helper" query-all "$QUERY" --limit "$SEM_LIMIT" 2>/dev/null | head -"$SEM_LIMIT"
+  hits=$((hits+1))
+  echo ""
+}
+
+if [[ "$SEMANTIC" -eq 1 ]]; then
+  _search_semantic
+fi
+
+case "$SCOPE" in
+  brain) _search_brain ;;
+  trace) _search_trace ;;
+  git)   _search_git ;;
+  all)   _search_brain; _search_trace; _search_git ;;
+esac
+
+"$TRACER" recall query="$QUERY" scope="$SCOPE" semantic="$SEMANTIC" hits="$hits" >/dev/null 2>&1 || true

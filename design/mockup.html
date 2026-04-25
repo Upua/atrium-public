@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Atrium — mid-flight mockup</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  html, body {
+    background: #000;
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    display: grid;
+    place-items: center;
+    padding: 14px;
+  }
+
+  /* ── Kitty OS window — the outer chrome ──────────────────────── */
+  .kitty {
+    width: 1060px;
+    height: 720px;
+    background: var(--bg);
+    border: 1px solid #2a2218;
+    box-shadow: 0 0 0 1px #000;
+    display: grid;
+    grid-template-rows: 22px 1fr;
+    position: relative;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg);
+    font-variant-ligatures: none;
+  }
+
+  .titlebar {
+    background: #0a0806;
+    color: var(--fg-dim);
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    gap: 8px;
+    border-bottom: 1px solid #2a2218;
+  }
+  .titlebar .dots { display: flex; gap: 5px; margin-right: 8px; }
+  .titlebar .dots span { width: 10px; height: 10px; background: #4a3d2e; display: inline-block; border-radius: 50%;}
+  .titlebar .dots span:nth-child(1) { background: #b85a3a; }
+  .titlebar .dots span:nth-child(2) { background: #d89a4a; }
+  .titlebar .dots span:nth-child(3) { background: #8ca05a; }
+  .titlebar .ttl { color: var(--fg); }
+  .titlebar .sig { color: var(--accent-plan); margin-right: 6px; }
+  .titlebar .rhs { margin-left: auto; color: var(--fg-faint); }
+
+  /* ── Zellij layout grid ──────────────────────────────────────── */
+  .zellij {
+    display: grid;
+    grid-template-rows: 18px 1fr 18px 24px;
+    padding: 6px 8px;
+    gap: 4px;
+  }
+
+  /* Zellij tab bar */
+  .tabbar {
+    display: flex;
+    align-items: center;
+    color: var(--fg-dim);
+    font-size: 11px;
+    gap: 2px;
+  }
+  .tabbar .tab {
+    padding: 0 10px;
+    border: 1px solid transparent;
+  }
+  .tabbar .tab.active {
+    color: var(--accent-plan);
+    border-color: var(--fg-faint);
+    background: var(--bg-raised);
+  }
+  .tabbar .idx { color: var(--fg-faint); margin-right: 4px; }
+  .tabbar .sep { color: var(--fg-faint); padding: 0 4px; }
+  .tabbar .session { margin-left: auto; color: var(--fg-faint); font-size: 10px; letter-spacing: 0.1em; }
+  .tabbar .session .name { color: var(--accent-peer); }
+
+  /* ── work tab interior — 3-column split ──────────────────────── */
+  .work {
+    display: grid;
+    grid-template-columns: 1.8fr 1fr 1fr;
+    gap: 4px;
+    min-height: 0;
+  }
+
+  .pane {
+    background: var(--bg-raised);
+    border: 1px solid var(--fg-faint);
+    display: grid;
+    grid-template-rows: 18px 1fr;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .pane.focused { border-color: var(--c7); }
+  .pane .paneh {
+    background: var(--bg-sunk);
+    border-bottom: 1px solid var(--fg-faint);
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 8px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .pane.focused .paneh { color: var(--fg); }
+  .pane .paneh .sig { color: var(--accent-plan); }
+  .pane .paneh .rhs { margin-left: auto; color: var(--fg-faint); }
+  .pane .body {
+    padding: 8px 10px;
+    overflow: hidden;
+    min-height: 0;
+    line-height: 1.4;
+  }
+
+  /* ── main pane — code editor w/ nvim-ish gutter ──────────────── */
+  .code {
+    font-size: 12px;
+    color: var(--fg);
+    white-space: pre;
+  }
+  .code .ln { color: var(--fg-faint); display: inline-block; width: 28px; text-align: right; margin-right: 10px; user-select: none; }
+  .code .kw   { color: var(--c5); }
+  .code .str  { color: var(--c2); }
+  .code .fn   { color: var(--c12); }
+  .code .cm   { color: var(--fg-faint); font-style: italic; }
+  .code .num  { color: var(--c11); }
+  .code .agent-voice { color: var(--c14); }
+  .code .cur  {
+    background: var(--c3);
+    color: var(--bg);
+    display: inline-block;
+    width: 7.5px;
+    animation: blink 1s steps(2, end) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .code .diff-add { background: rgba(168, 192, 112, 0.12); display: block; }
+  .code .diff-add::before { content: "+"; color: var(--c10); margin-right: 4px; }
+  .code .diff-del { background: rgba(184, 90, 58, 0.12); display: block; }
+  .code .diff-del::before { content: "-"; color: var(--c9); margin-right: 4px; }
+
+  .statusline {
+    position: absolute;
+    left: 0; right: 0;
+    bottom: 0;
+    background: var(--bg-sunk);
+    padding: 2px 8px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    display: flex;
+    gap: 12px;
+  }
+  .statusline .mode {
+    background: var(--accent-plan);
+    color: var(--bg);
+    padding: 0 6px;
+    font-weight: 500;
+  }
+  .statusline .file { color: var(--fg); }
+  .statusline .rhs { margin-left: auto; color: var(--fg-faint); }
+
+  /* ── peers pane ──────────────────────────────────────────────── */
+  .peers {
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .peers .section {
+    color: var(--fg-faint);
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin: 0 0 6px;
+  }
+  .peers .peer {
+    display: grid;
+    grid-template-columns: 10px 1fr auto;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--c8);
+  }
+  .peers .peer .dot { color: var(--c10); }
+  .peers .peer.paused .dot { color: var(--c11); }
+  .peers .peer.idle .dot { color: var(--fg-faint); }
+  .peers .peer .name { color: var(--accent-peer); }
+  .peers .peer .meta { color: var(--fg-dim); font-size: 10px; }
+  .peers .peer .hb { color: var(--fg-faint); font-size: 10px; }
+
+  .plan-card {
+    margin-top: 14px;
+    border: 1px solid var(--accent-plan);
+    background: rgba(216, 154, 74, 0.06);
+    padding: 10px 12px;
+    font-size: 11px;
+  }
+  .plan-card .h {
+    color: var(--accent-plan);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .plan-card .step { display: grid; grid-template-columns: 14px 1fr; gap: 6px; margin: 3px 0; color: var(--fg-dim); }
+  .plan-card .step .b { color: var(--c10); }
+  .plan-card .step.curr { color: var(--fg); }
+  .plan-card .step.curr .b { color: var(--accent-plan); }
+  .plan-card .step.pending .b { color: var(--fg-faint); }
+  .plan-card .ask {
+    color: var(--accent-plan);
+    font-size: 11px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--fg-faint);
+  }
+
+  .ctx-meter {
+    margin-top: 12px;
+    font-size: 10px;
+    color: var(--fg-dim);
+  }
+  .ctx-meter .bar {
+    height: 8px;
+    background: var(--bg-sunk);
+    border: 1px solid var(--fg-faint);
+    margin-top: 4px;
+    position: relative;
+  }
+  .ctx-meter .bar .fill {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    background: var(--accent-plan);
+    width: 47%;
+  }
+  .ctx-meter .bar .mark {
+    position: absolute;
+    top: -2px; bottom: -2px;
+    width: 1px;
+    background: var(--c9);
+  }
+  .ctx-meter .bar .mark.m70 { left: 70%; }
+  .ctx-meter .labels {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-size: 9px;
+    color: var(--fg-faint);
+  }
+
+  /* ── trace pane — rolling log + sparkline ────────────────────── */
+  .trace {
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+  }
+  .trace .spark-row {
+    padding: 6px 0 10px;
+    border-bottom: 1px dashed var(--c8);
+    margin-bottom: 6px;
+  }
+  .trace .spark-row .lbl {
+    color: var(--fg-faint);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 3px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .trace .spark {
+    font-size: 14px;
+    letter-spacing: -1px;
+    color: var(--accent-trace);
+    line-height: 1;
+  }
+  .trace .spark .now { color: var(--accent-plan); }
+  .trace .entry {
+    display: grid;
+    grid-template-columns: 58px 54px 1fr;
+    gap: 6px;
+    font-size: 10px;
+    padding: 2px 0;
+    color: var(--fg-dim);
+  }
+  .trace .entry .ts { color: var(--fg-faint); }
+  .trace .entry .k  { text-transform: lowercase; }
+  .trace .entry .k.tool { color: var(--c12); }
+  .trace .entry .k.cmd { color: var(--fg); }
+  .trace .entry .k.ga  { color: var(--c10); }
+  .trace .entry .k.gb  { color: var(--c9); }
+  .trace .entry .k.cmt { color: var(--accent-peer); }
+  .trace .entry .k.kill{ color: var(--c9); }
+  .trace .entry .msg { color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .trace .entry.current { background: rgba(216,154,74,0.06); }
+
+  /* ── HUD row ─────────────────────────────────────────────────── */
+  .hud {
+    background: var(--bg-sunk);
+    border-top: 1px solid var(--fg-faint);
+    border-bottom: 1px solid var(--fg-faint);
+    padding: 1px 10px;
+    font-size: 11px;
+    color: var(--fg);
+    display: flex;
+    align-items: center;
+    gap: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .hud .sep { color: var(--fg-faint); padding: 0 10px; }
+  .hud .dim { color: var(--fg-dim); }
+  .hud .brass { color: var(--accent-plan); }
+  .hud .peer  { color: var(--accent-peer); }
+  .hud .trace { color: var(--accent-trace); }
+  .hud .ok    { color: var(--c10); }
+  .hud .warn  { color: var(--c11); }
+  .hud .alert { color: var(--c9); }
+
+  /* ── Zellij status bar (bottom) ──────────────────────────────── */
+  .statusbar {
+    background: var(--bg-sunk);
+    color: var(--fg-dim);
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 10px;
+    border-top: 1px solid var(--fg-faint);
+    letter-spacing: 0.04em;
+  }
+  .statusbar .mode {
+    background: var(--c6);
+    color: var(--bg);
+    padding: 0 8px;
+    font-weight: 500;
+  }
+  .statusbar .key { color: var(--accent-plan); }
+  .statusbar .rhs { margin-left: auto; color: var(--fg-faint); }
+
+  /* ── Ambient mascot — a floating KGP peer window ─────────────── */
+  .mascot-window {
+    position: absolute;
+    top: 48px;
+    right: -40px;
+    width: 200px;
+    height: 170px;
+    background: var(--bg);
+    border: 1px solid #3a2d1a;
+    box-shadow:
+      0 0 0 1px #000,
+      -12px 8px 24px rgba(0,0,0,0.6);
+    display: grid;
+    grid-template-rows: 20px 1fr 16px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    overflow: hidden;
+  }
+  .mascot-window .mbh {
+    background: var(--bg-sunk);
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 6px;
+    border-bottom: 1px solid #2a2218;
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+  .mascot-window .mbh .dots { display: flex; gap: 3px; margin-right: 4px; }
+  .mascot-window .mbh .dots span {
+    width: 6px; height: 6px;
+    background: #3a2d1a;
+    display: inline-block;
+    border-radius: 50%;
+  }
+  .mascot-window .mbh .sig { color: var(--accent-plan); }
+  .mascot-window .mbody {
+    background:
+      radial-gradient(circle at 50% 40%, #1a1410 0%, #0a0806 80%);
+    display: grid;
+    place-items: center;
+    padding: 8px;
+  }
+  .mascot-window .mfoot {
+    background: var(--bg-sunk);
+    border-top: 1px solid #2a2218;
+    font-size: 9px;
+    color: var(--fg-faint);
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    letter-spacing: 0.06em;
+  }
+  .mascot-window .mfoot .pulse { color: var(--c10); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+
+  /* The mascot itself — ASCII pixel creature, like a Game Boy utility app */
+  .mascot {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1;
+    color: var(--accent-plan);
+    white-space: pre;
+    text-align: center;
+    letter-spacing: 0;
+  }
+  .mascot .body { color: var(--c7); }
+  .mascot .eye  { color: var(--accent-plan); animation: blink 4s steps(2, end) infinite; }
+  .mascot .shadow { color: var(--fg-faint); }
+
+  /* Position the mascot to peek out beside the main kitty window */
+  .wrap {
+    position: relative;
+  }
+
+  /* Tiny overlay: pane-id labels (like a real zellij) */
+  .paneid {
+    position: absolute;
+    top: 2px; right: 4px;
+    color: var(--fg-faint);
+    font-size: 8px;
+    letter-spacing: 0.12em;
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <!-- MAIN KITTY WINDOW -->
+  <div class="kitty">
+
+    <div class="titlebar">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="sig">⌖</span><span class="ttl">Atrium</span>
+      <span class="rhs">kitty · zellij/atrium · agent-v0 · t+42m</span>
+    </div>
+
+    <div class="zellij">
+
+      <!-- Zellij tab bar -->
+      <div class="tabbar">
+        <span class="tab active"><span class="idx">1</span>work</span>
+        <span class="tab"><span class="idx">2</span>monitor</span>
+        <span class="tab"><span class="idx">3</span>peers</span>
+        <span class="tab"><span class="idx">4</span>+</span>
+        <span class="session"><span>session</span>&nbsp;<span class="name">atrium</span>&nbsp;<span>· locked</span></span>
+      </div>
+
+      <!-- Work tab — 3-column split -->
+      <div class="work">
+
+        <!-- MAIN PANE — nvim editing atrium-guard -->
+        <div class="pane focused">
+          <div class="paneh">
+            <span class="sig">⌖</span>
+            <span>main · nvim · bin/atrium-guard</span>
+            <span class="rhs">~/Atrium · master ●</span>
+          </div>
+          <div class="body" style="position: relative;">
+<div class="code"><span class="ln">42</span>  <span class="cm"># 1. Pattern match against blocklist</span>
+<span class="ln">43</span>  BLOCKED_PATTERN=$(python3 - <span class="str">"$BLOCKLIST"</span> <span class="str">"$CMD"</span> &lt;&lt;<span class="str">'PY'</span>
+<span class="ln">44</span>  <span class="kw">import</span> sys, re
+<span class="ln">45</span>  block_file, cmd = sys.argv[<span class="num">1</span>], sys.argv[<span class="num">2</span>]
+<span class="ln">46</span>  <span class="kw">with</span> <span class="fn">open</span>(block_file) <span class="kw">as</span> f:
+<span class="ln">47</span>      <span class="kw">for</span> ln <span class="kw">in</span> f:
+<span class="ln">48</span>          ln = ln.strip()
+<span class="ln">49</span>          <span class="kw">if</span> <span class="kw">not</span> ln <span class="kw">or</span> ln.startswith(<span class="str">"#"</span>): <span class="kw">continue</span>
+<span class="ln">50</span>          <span class="kw">try</span>:
+<span class="ln">51</span>              <span class="kw">if</span> re.search(ln, cmd):
+<span class="ln">52</span>                  <span class="fn">print</span>(ln); sys.exit(<span class="num">0</span>)
+<span class="ln">53</span>          <span class="kw">except</span> re.error:
+<span class="ln">54</span>              <span class="kw">continue</span>
+<span class="ln">55</span>  sys.exit(<span class="num">1</span>)
+<span class="ln">56</span>  PY
+<span class="ln">57</span>  )
+<span class="ln">58</span>
+<span class="ln">59</span>  <span class="cm"># 2. Budget check — v0.2: also check per-hour burn cap</span>
+<span class="diff-del"><span class="ln">60</span>  SPENT=$(_spend_today)</span>
+<span class="diff-add"><span class="ln">60</span>  SPENT=$(_spend_today)</span>
+<span class="diff-add"><span class="ln">61</span>  BURN_HR=$(_burn_last_hour)</span>
+<span class="diff-add"><span class="ln">62</span>  <span class="kw">if</span> python3 -c <span class="str">"..."</span>; <span class="kw">then</span><span class="cur">&nbsp;</span></span>
+<span class="ln">63</span>      <span class="str">"$TRACER"</span> guard_block cmd=<span class="str">"$CMD"</span> reason=burn_rate
+<span class="ln">64</span>      <span class="fn">echo</span> <span class="str">"atrium-guard: BLOCKED — burn &gt; \$$CAP/hr"</span> &gt;&amp;2
+</div>
+            <div class="statusline">
+              <span class="mode">INSERT</span>
+              <span class="file">bin/atrium-guard</span>
+              <span>sh</span>
+              <span>utf-8</span>
+              <span class="rhs">62:28 · 48%</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- PEERS PANE -->
+        <div class="pane">
+          <div class="paneh">
+            <span>peer roster</span>
+            <span class="rhs">3 alive · 1 paused</span>
+          </div>
+          <div class="body peers">
+            <div class="section">spawned peers</div>
+
+            <div class="peer">
+              <span class="dot">●</span>
+              <div>
+                <span class="name">cortex</span><br>
+                <span class="meta">nvim --listen peers/cortex/sock</span>
+              </div>
+              <span class="hb">hb 2s</span>
+            </div>
+
+            <div class="peer">
+              <span class="dot">●</span>
+              <div>
+                <span class="name">archivist</span><br>
+                <span class="meta">tail walkthrough.md · write brain/decisions</span>
+              </div>
+              <span class="hb">hb 5s</span>
+            </div>
+
+            <div class="peer paused">
+              <span class="dot">●</span>
+              <div>
+                <span class="name">evaluator</span><br>
+                <span class="meta">paused · waiting on plan step 5</span>
+              </div>
+              <span class="hb">hb 1m</span>
+            </div>
+
+            <div class="peer idle">
+              <span class="dot">○</span>
+              <div>
+                <span class="name">mascot</span><br>
+                <span class="meta">kgp · OS window · ambient</span>
+              </div>
+              <span class="hb">ext</span>
+            </div>
+
+            <!-- plan-gated execution card -->
+            <div class="plan-card">
+              <div class="h">
+                <span>◉ plan-gated · step 4 / 6</span>
+                <span>v0.3 ritual</span>
+              </div>
+              <div class="step"><span class="b">✓</span><span>add burn-rate cap to guard</span></div>
+              <div class="step"><span class="b">✓</span><span>wire _burn_last_hour helper</span></div>
+              <div class="step"><span class="b">✓</span><span>extend blocklist vocabulary</span></div>
+              <div class="step curr"><span class="b">◉</span><span>commit + verify (you are here)</span></div>
+              <div class="step pending"><span class="b">○</span><span>evaluator: replay today's trace</span></div>
+              <div class="step pending"><span class="b">○</span><span>walkthrough entry · checkpoint</span></div>
+              <div class="ask">awaiting niklas · Super+Y to approve step</div>
+            </div>
+
+            <!-- Context meter -->
+            <div class="ctx-meter">
+              <div style="display:flex; justify-content:space-between;">
+                <span>context window</span>
+                <span style="color: var(--accent-plan);">47% · 94 k / 200 k</span>
+              </div>
+              <div class="bar">
+                <div class="fill"></div>
+                <div class="mark m70"></div>
+              </div>
+              <div class="labels">
+                <span>0</span>
+                <span style="color: var(--c9);">handoff @ 70%</span>
+                <span>200k</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TRACE PANE -->
+        <div class="pane">
+          <div class="paneh">
+            <span>trace.jsonl · tail</span>
+            <span class="rhs">312 events today</span>
+          </div>
+          <div class="body trace">
+
+            <div class="spark-row">
+              <div class="lbl"><span>burn · last 30 min</span><span>$/min</span></div>
+              <div class="spark">▁▁▂▂▂▃▃▃▂▃▃▄▃▃▄▅▄▄▃▄▅▄▃▃▄▄▅▅<span class="now">▆</span></div>
+              <div class="lbl" style="margin-top:6px;"><span>events · last 30 min</span><span>/min</span></div>
+              <div class="spark" style="color: var(--accent-peer);">▂▃▂▃▄▃▄▅▅▄▅▆▅▆▆▇▆▇▇▆▇▇██▇█▇▇<span class="now" style="color: var(--accent-plan);">█</span></div>
+            </div>
+
+            <div class="entry"><span class="ts">15:12:47</span><span class="k tool">tool</span><span class="msg">Read · bin/atrium-guard</span></div>
+            <div class="entry"><span class="ts">15:12:48</span><span class="k tool">tool</span><span class="msg">Edit · bin/atrium-guard +3 -1</span></div>
+            <div class="entry"><span class="ts">15:12:52</span><span class="k ga">allow</span><span class="msg">atrium-guard check './tests/burn.sh'</span></div>
+            <div class="entry"><span class="ts">15:12:53</span><span class="k cmd">cmd</span><span class="msg">./tests/burn.sh  exit 0  14ms</span></div>
+            <div class="entry"><span class="ts">15:13:01</span><span class="k tool">tool</span><span class="msg">Read · state/blocklist.txt</span></div>
+            <div class="entry"><span class="ts">15:13:04</span><span class="k tool">tool</span><span class="msg">Edit · state/blocklist.txt +2</span></div>
+            <div class="entry"><span class="ts">15:13:09</span><span class="k gb">block</span><span class="msg">curl ... | sh   · reason: pipe-to-shell</span></div>
+            <div class="entry"><span class="ts">15:13:12</span><span class="k tool">tool</span><span class="msg">Write · brain/implementation_plan.md</span></div>
+            <div class="entry"><span class="ts">15:13:19</span><span class="k cmd">cmd</span><span class="msg">atrium-hud  14ms</span></div>
+            <div class="entry"><span class="ts">15:13:24</span><span class="k cmt">commit</span><span class="msg">9c21ef · guard: burn-rate cap + 2 patterns</span></div>
+            <div class="entry current"><span class="ts">15:13:29</span><span class="k tool">tool</span><span class="msg">Edit · bin/atrium-guard (awaiting verify)</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HUD line -->
+      <div class="hud">
+        <span class="brass">⌖ atrium</span>
+        <span class="sep">│</span>
+        <span>↑42m</span>
+        <span class="sep">│</span>
+        <span class="dim">burn</span>&nbsp;<span class="trace">▁▂▃▄▅</span>&nbsp;<span class="warn">$1.04/m</span>
+        <span class="sep">│</span>
+        <span class="warn">[▓▓▓▓▓░░░░░]</span>&nbsp;<span>$4.86</span>&nbsp;<span class="dim">of</span>&nbsp;<span>$10</span>
+        <span class="sep">│</span>
+        <span class="dim">ctx</span>&nbsp;<span class="warn">47%</span>
+        <span class="sep">│</span>
+        <span class="trace">●312</span>
+        <span class="sep">│</span>
+        <span class="peer">peers 3↑</span>
+        <span class="sep">│</span>
+        <span class="brass">◉ plan 4/6 · awaiting approval</span>
+      </div>
+
+      <!-- Zellij status bar -->
+      <div class="statusbar">
+        <span class="mode">LOCKED</span>
+        <span><span class="key">Ctrl+g</span> normal</span>
+        <span><span class="key">Ctrl+p</span> pane</span>
+        <span><span class="key">Ctrl+t</span> tab</span>
+        <span><span class="key">Super+Y</span> approve step</span>
+        <span><span class="key">Super+⇧Esc</span> kill</span>
+        <span class="rhs">Tab 1 · work · 3 panes</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- AMBIENT MASCOT — separate KGP peer window, peeks out to the right -->
+  <div class="mascot-window">
+    <div class="mbh">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="sig">⌖</span><span>mascot · kgp peer</span>
+    </div>
+    <div class="mbody">
+<div class="mascot">        <span class="shadow">▁▁▁▁▁▁▁▁</span>
+       <span class="body">▗▄▄▄▄▄▄▖</span>
+      <span class="body">▗▛        ▜▖</span>
+      <span class="body">▐  </span><span class="eye">◉</span><span class="body">    </span><span class="eye">◉</span><span class="body">  ▌</span>
+      <span class="body">▐   </span><span style="color: var(--accent-peer);">───</span><span class="body">   ▌</span>
+      <span class="body">▝▙        ▟▘</span>
+       <span class="body">▝▀▀▀▀▀▀▘</span>
+        <span class="shadow">▔▔▔▔▔▔▔▔</span></div>
+    </div>
+    <div class="mfoot">
+      <span class="pulse">●</span>
+      <span>alert</span>
+      <span style="margin-left: auto; color: var(--fg-dim);">watching</span>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

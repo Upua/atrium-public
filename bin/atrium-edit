@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# atrium-edit — one-line sugar for opening a file in the headless nvim peer.
+#
+# Usage:
+#   atrium-edit <file>              # open file in nvim peer
+#   atrium-edit <file> --do '<cmd>' # open file, then run a vimscript/lua
+#                                     (prefix 'lua ' for Lua)
+#
+# --do may be repeated — each command runs in order before the final save.
+# Prior to v0.5 Tier 2, multiple --do flags silently collapsed to the last
+# value via bash arg re-assignment; a three-op buffer mutation lost the
+# first two ops with no warning. Now: list-append, execute sequentially.
+#
+# Spawns the nvim peer if it's not running. The buffer stays loaded after
+# edit, so subsequent `atrium-edit` calls feel instant.
+#
+# Compared to the regular Edit tool: every call emits a trace event with
+# file + (optional) op, updates the nvim peer heartbeat, and the nvim
+# peer itself is visible in the roster.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_edit"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-edit' is now a cognitive verb. Consider using 'atrium edit' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+NVIM_CLI="$ATRIUM_ROOT/bin/atrium-nvim"
+
+FILE=""
+DO_CMDS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --do)  DO_CMDS+=("$2"); shift 2 ;;
+    --help|-h) sed -n '2,16p' "$0"; exit 0 ;;
+    -*)  echo "atrium-edit: unknown flag: $1" >&2; exit 2 ;;
+    *)   if [[ -z "$FILE" ]]; then FILE="$1"; shift; else
+           echo "atrium-edit: only one file allowed (got extra: $1)" >&2; exit 2
+         fi ;;
+  esac
+done
+
+[[ -n "$FILE" ]] || { echo "atrium-edit: need a file path" >&2; exit 2; }
+
+# ensure nvim peer is running
+if ! "$NVIM_CLI" sock >/dev/null 2>&1 || [[ ! -S "$("$NVIM_CLI" sock)" ]]; then
+  "$NVIM_CLI" spawn >/dev/null
+fi
+
+"$NVIM_CLI" edit "$FILE"
+
+if [[ ${#DO_CMDS[@]} -gt 0 ]]; then
+  for cmd in "${DO_CMDS[@]}"; do
+    "$NVIM_CLI" do "$cmd"
+  done
+  # Persist buffer after mutations. `update` only writes if modified, so it's
+  # a no-op for read-only --do payloads. `silent!` suppresses the "nothing to
+  # write" noise on unmodified buffers and doesn't swallow real errors.
+  "$NVIM_CLI" do 'silent! update'
+  # Reset the nvim peer status line so the roster shows "edited: <file>" instead
+  # of "ran: silent! update" (the last cmd_do status overwrites the useful one).
+  "$ATRIUM_ROOT/bin/atrium-peer" heartbeat nvim --status "edited: $(basename "$FILE")" >/dev/null 2>&1 || true
+fi
+
+if [[ ${#DO_CMDS[@]} -gt 0 ]]; then
+  echo "edited: $FILE (+ do: ${#DO_CMDS[@]} cmd$([ ${#DO_CMDS[@]} -eq 1 ] || echo s), saved)"
+else
+  echo "edited: $FILE"
+fi

@@ -1,0 +1,66 @@
+// agent-v0 — first daily-driver layout
+// Tabs are contexts, not documents. Every tab is agent-reshapeable.
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        // HUD: uptime, burn rate, spent/budget, event count, last-tool age.
+        // Refreshed every 2s via `watch -t`. atrium-hud runs in <50ms.
+        // close_on_exit=false — if watch dies (or user Ctrl-Cs it), the pane
+        // stays open with a "press ENTER to re-run" prompt instead of
+        // vanishing. Survives accidental kills.
+        pane size=1 borderless=true command="watch" close_on_exit=false {
+            args "-n" "2" "-t" "atrium-hud"
+        }
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    // WORK — primary focus. Main editor/cmd pane + log/output stack.
+    tab name="work" focus=true {
+        pane split_direction="vertical" {
+            pane size="70%" name="main"
+            pane size="30%" stacked=true {
+                pane name="logs"
+                pane name="scratch"
+            }
+        }
+    }
+
+    // MONITOR — ambient state. Claude breadcrumbs + cortex pulse + sidetrack.
+    // Panes start with commands; reshape freely at runtime.
+    tab name="monitor" {
+        pane split_direction="horizontal" {
+            pane size="33%" name="breadcrumbs" command="tail" {
+                args "-F" "~/.claude/cache/session-breadcrumbs.md"
+                start_suspended false
+            }
+            pane size="33%" name="sidetrack" command="tail" {
+                args "-F" "~/.claude/sidetrack.md"
+                start_suspended false
+            }
+            // Was: watch -n 5 claude mcp list — but that cold-started the
+            // whole MCP stack every 5s (20+ servers, ~100 procs each round),
+            // running for 26h+ once the tab was focused. Package temp pinned
+            // at 96°C (4°C from throttle). Replaced with atrium observe,
+            // which composes existing file-read primitives — same proprioception
+            // surface, zero MCP churn. Interval bumped 5→10s.
+            pane size="34%" name="sense" command="watch" {
+                args "-n" "10" "-t" "atrium observe"
+                start_suspended false
+            }
+        }
+    }
+
+    // PEERS — roster of spawned agents. Populated by atrium-peer-panel which
+    // scans ~/Atrium/peers/*/heartbeat.json and status.md. Refreshes every 2s.
+    tab name="peers" {
+        pane command="watch" close_on_exit=false {
+            args "-n" "2" "-t" "atrium-peer-panel"
+        }
+    }
+}

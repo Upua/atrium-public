@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# atrium-snap — screenshot the main Atrium cockpit window.
+#
+# Usage:
+#   atrium-snap                          # snap work tab, path on stdout
+#   atrium-snap --tab peers              # switch to peers tab, then snap
+#   atrium-snap --out /path/to/file.png  # custom output path
+#   atrium-snap --wid 71303182           # explicit window id (skip auto-find)
+#   atrium-snap --all                    # full-screen (not window-only)
+#
+# Output: the resulting PNG path on stdout (so shell can capture it).
+# Logs a trace event. Uses ImageMagick's `import` (standard on X11).
+#
+# How it picks the window:
+#   wmctrl -lx yields class "atrium.atrium" for the cockpit and
+#   "atrium-mascot.atrium-mascot" for the mascot. We match EXACTLY "atrium.atrium".
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+TAB=""
+OUT=""
+WID=""
+ALL=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tab) TAB="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    --wid) WID="$2"; shift 2 ;;
+    --all) ALL=1; shift ;;
+    --help|-h) sed -n '2,16p' "$0"; exit 0 ;;
+    *) echo "atrium-snap: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+# default output path — timestamped, under /tmp
+if [[ -z "$OUT" ]]; then
+  OUT="/tmp/atrium-snap-$(date +%Y%m%d-%H%M%S).png"
+fi
+
+# tool check
+command -v import >/dev/null || { echo "atrium-snap: ImageMagick 'import' not found" >&2; exit 3; }
+
+# find main atrium cockpit WID unless given / unless --all
+if [[ "$ALL" -eq 0 && -z "$WID" ]]; then
+  WID=$(wmctrl -lx 2>/dev/null | awk '$3=="atrium.atrium"{print $1; exit}')
+  if [[ -z "$WID" ]]; then
+    echo "atrium-snap: no Atrium window found (class atrium.atrium). Is it running?" >&2
+    exit 4
+  fi
+fi
+
+# optional tab switch via zellij action (suppress BOTH stdout and stderr —
+# the command prints a pane index on success which we don't want to leak
+# through our stdout contract)
+if [[ -n "$TAB" ]]; then
+  if command -v zellij >/dev/null; then
+    zellij --config-dir "$ATRIUM_ROOT/zellij" action go-to-tab-name "$TAB" >/dev/null 2>&1 || true
+    sleep 1  # let the pane redraw
+  fi
+fi
+
+# raise/focus the window (so capture has fresh render, not stale)
+if [[ "$ALL" -eq 0 && -n "$WID" ]] && command -v xdotool >/dev/null; then
+  xdotool windowactivate "$WID" >/dev/null 2>&1 || true
+  sleep 0.3
+fi
+
+# capture
+if [[ "$ALL" -eq 1 ]]; then
+  import -window root "$OUT" 2>/dev/null
+else
+  import -window "$WID" "$OUT" 2>/dev/null
+fi
+
+if [[ ! -s "$OUT" ]]; then
+  echo "atrium-snap: import produced empty file" >&2
+  exit 5
+fi
+
+# trace
+"$TRACER" snap path="$OUT" tab="${TAB:-}" wid="${WID:-all}" bytes="$(stat -c%s "$OUT")" >/dev/null 2>&1 || true
+
+echo "$OUT"

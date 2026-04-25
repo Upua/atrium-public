@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# atrium-peer-panel — renders the peer roster (mockup-style).
+#
+# Scans ~/Atrium/peers/*/{heartbeat.json,status.md} and prints one block
+# per peer. Runs in <50ms. Intended for `watch -n 2 atrium-peer-panel`
+# in the peers tab of agent-v0.
+#
+# Per peer:
+#
+#   ●  cortex                              hb 2s
+#      └ role: watcher
+#        last tail ~/.claude/sidetrack.md
+#
+# Heartbeat colors: green <60s, amber <5m, red ≥5m or missing.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+PEERS_DIR="$ATRIUM_ROOT/peers"
+
+python3 - "$PEERS_DIR" <<'PY'
+import sys, os, json, datetime
+from pathlib import Path
+
+root = Path(sys.argv[1])
+USE_COLOR = sys.stdout.isatty()
+def c(code, s): return f"\x1b[{code}m{s}\x1b[0m" if USE_COLOR else s
+
+# palette roles (ANSI 16, inherits kitty.conf oxidized-copper)
+BRASS  = "33"    # headings
+OLIVE  = "32"    # alive
+AMBER  = "93"    # warning (stale soon)
+RED    = "31"    # stale/dead
+VERD   = "36"    # cyan — peer accent
+DIM    = "2"
+FRAME  = "90"    # dim separator
+
+if not root.exists() or not any(root.iterdir()):
+    print(c(DIM, "(no peers registered)"))
+    sys.exit(0)
+
+now = datetime.datetime.now().astimezone()
+alive = paused = stale = 0
+
+peers = []
+for d in sorted(root.iterdir()):
+    if not d.is_dir(): continue
+    hb = d / "heartbeat.json"
+    sp = d / "status.md"
+    if not hb.exists():
+        peers.append((d.name, "", "unreg", None, sp.read_text().strip() if sp.exists() else ""))
+        stale += 1
+        continue
+    try:
+        data = json.loads(hb.read_text())
+    except Exception:
+        peers.append((d.name, "", "?", None, "(corrupt heartbeat)"))
+        stale += 1
+        continue
+    ts = data.get("ts", "")
+    role = data.get("role", "")
+    try:
+        t = datetime.datetime.fromisoformat(ts)
+        age_s = (now - t).total_seconds()
+    except Exception:
+        age_s = None
+    if age_s is None:
+        age_str = "?"; state = "stale"
+    elif age_s < 60:
+        age_str = f"{int(age_s)}s"; state = "alive"
+    elif age_s < 300:
+        age_str = f"{int(age_s/60)}m"; state = "paused"
+    elif age_s < 3600:
+        age_str = f"{int(age_s/60)}m"; state = "stale"
+    else:
+        age_str = f"{int(age_s/3600)}h"; state = "stale"
+
+    if state == "alive": alive += 1
+    elif state == "paused": paused += 1
+    else: stale += 1
+
+    status = sp.read_text().strip().split("\n", 1)[0] if sp.exists() else ""
+    peers.append((d.name, role, age_str, state, status))
+
+# header
+total = len(peers)
+hdr_parts = [
+    c(BRASS, "PEER ROSTER"),
+    c(DIM,  "·"),
+    f"{c(OLIVE, alive)} alive",
+    c(DIM, "·"),
+    f"{c(AMBER, paused)} paused",
+    c(DIM, "·"),
+    f"{c(RED, stale)} stale",
+]
+print(" ".join(hdr_parts))
+print(c(FRAME, "─" * 44))
+
+for name, role, age, state, status in peers:
+    if state == "alive":
+        dot = c(OLIVE, "●")
+    elif state == "paused":
+        dot = c(AMBER, "●")
+    else:
+        dot = c(RED, "○")
+    name_s = c(VERD, name)
+    age_s  = c(DIM, f"hb {age}")
+    print(f"{dot}  {name_s:<30} {age_s}")
+    if role:
+        print(f"   {c(DIM, '└ role:')} {role}")
+    if status:
+        print(f"     {c(DIM, status)}")
+    print()
+PY

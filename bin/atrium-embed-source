@@ -1,0 +1,588 @@
+#!/usr/bin/env python3.11
+"""
+atrium-embed-source — polymorphic embedding helper for Atrium's memory stack.
+
+Writes embeddings into Cortex's `embeddings` table for any (source_table, source_id, text)
+triple. Idempotent via text_hash — re-running with the same text is a no-op.
+
+Uses Cortex's own embedder (sentence-transformers / all-MiniLM-L6-v2) for consistency
+with the existing 828 solutions embeddings.
+
+Usage
+-----
+  # single entry
+  atrium-embed-source store <source_table> <source_id> <text>
+
+  # batch from stdin (TSV: source_table \\t source_id \\t text)
+  atrium-embed-source batch < entries.tsv
+
+  # inspect coverage
+  atrium-embed-source coverage
+
+  # query across one source table
+  atrium-embed-source query <source_table> <query_text> [--limit N]
+
+  # query across ALL populated source tables, merged by score
+  atrium-embed-source query-all <query_text> [--limit N]
+
+Design notes
+------------
+- Imports `cortex.store` + `cortex.embedder` directly via PYTHONPATH. No schema changes
+  to cortex.db. Strictly additive: only inserts/updates into the `embeddings` table.
+- source_table strings are free-form. Existing: 'solutions'. New ones we'll create:
+  'brain_walkthrough', 'brain_handoff', 'brain_decision', 'claude_memory',
+  'events_curated' (for breadcrumbs + dmn only),
+  'vault_insights' (deep-dream digests), 'vault_mind' (self-model + diary),
+  'meridian_community' (graph cluster summaries from meridian-graph/build.py).
+- source_id is caller-provided — typically the row id of the source table. For files,
+  use a deterministic hash of the file path or an incrementing index.
+- Refuses to embed text < 10 chars (noise filter).
+
+Rollback
+--------
+  sqlite3 ~/.local/share/cortex/cortex.db "DELETE FROM embeddings WHERE source_table = ?"
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+CORTEX_SRC = Path(
+    os.environ.get("ATRIUM_CORTEX_SRC", "~/cortex/src")
+).expanduser()
+if str(CORTEX_SRC) not in sys.path:
+    sys.path.insert(0, str(CORTEX_SRC))
+
+# Suppress HF progress output for CLI use.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+MIN_TEXT_LEN = 10
+PREVIEW_MAX = 240  # chars kept per preview row
+PREVIEW_DB = Path.home() / "Atrium" / "state" / "embedding_previews.sqlite"
+DAEMON_SOCKET = Path.home() / "Atrium" / "state" / "embed-daemon.sock"
+
+# Vault layout — set ATRIUM_VAULT_ROOT to point at your notes dir.
+# The script looks for Sessions/, Insights/, Claudes_Mind/ subdirs under it.
+VAULT_ROOT = Path(os.environ.get("ATRIUM_VAULT_ROOT", "~/Notes")).expanduser()
+SESSIONS_DIR = VAULT_ROOT / "Sessions"
+INSIGHTS_DIR = VAULT_ROOT / "Insights"
+MIND_DIR = VAULT_ROOT / "Claudes_Mind"
+
+
+def _daemon_query_all(text: str, limit: int, timeout_s: float = 1.0):
+    """Try the persistent embed daemon; return list of hit dicts or None on failure.
+
+    Used when --client is passed (or auto-detected). Absent/unresponsive daemon
+    returns None so callers can fall back to in-process embedding.
+    """
+    import json
+    import socket
+
+    if not DAEMON_SOCKET.exists():
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout_s)
+        s.connect(str(DAEMON_SOCKET))
+        req = json.dumps({"op": "query_all", "text": text, "limit": limit}).encode() + b"\n"
+        s.sendall(req)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        line, _, _ = buf.partition(b"\n")
+        resp = json.loads(line.decode("utf-8"))
+        if not resp.get("ok"):
+            return None
+        return resp.get("hits", [])
+    except Exception:
+        return None
+
+
+def _preview_db():
+    """Lazy-open preview sidecar DB. Atrium-owned, additive to the stack."""
+    import sqlite3
+
+    PREVIEW_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(PREVIEW_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS previews ("
+        "  source_table TEXT NOT NULL,"
+        "  source_id    INTEGER NOT NULL,"
+        "  preview_text TEXT NOT NULL,"
+        "  ts_created   REAL NOT NULL,"
+        "  UNIQUE(source_table, source_id)"
+        ")"
+    )
+    conn.commit()
+    return conn
+
+
+def _store_preview(pdb, source_table: str, source_id: int, text: str) -> None:
+    import time
+
+    snippet = text[:PREVIEW_MAX].replace("\n", " ").strip()
+    pdb.execute(
+        "INSERT INTO previews (source_table, source_id, preview_text, ts_created) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(source_table, source_id) DO UPDATE SET "
+        "preview_text=excluded.preview_text, ts_created=excluded.ts_created",
+        (source_table, source_id, snippet, time.time()),
+    )
+    pdb.commit()
+
+
+def _get_preview(pdb, source_table: str, source_id: int):
+    row = pdb.execute(
+        "SELECT preview_text FROM previews WHERE source_table=? AND source_id=?",
+        (source_table, source_id),
+    ).fetchone()
+    return row["preview_text"] if row else None
+
+
+def _store():
+    from cortex.store import Store
+
+    s = Store()
+    s.connect()
+    return s
+
+
+def _embed_text(text: str):
+    from cortex.embedder import embed, vector_to_bytes
+
+    return vector_to_bytes(embed(text))
+
+
+def cmd_store(args: argparse.Namespace) -> int:
+    if len(args.text) < MIN_TEXT_LEN:
+        print(f"refuse: text < {MIN_TEXT_LEN} chars", file=sys.stderr)
+        return 2
+    s = _store()
+    pdb = _preview_db()
+    try:
+        s.store_embedding(args.source_table, int(args.source_id), args.text, _embed_text(args.text))
+        _store_preview(pdb, args.source_table, int(args.source_id), args.text)
+        print(f"stored: {args.source_table}:{args.source_id}  ({len(args.text)} chars)")
+        return 0
+    finally:
+        s.close()
+        pdb.close()
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    s = _store()
+    pdb = _preview_db()
+    n_ok = n_skip = 0
+    try:
+        for lineno, line in enumerate(sys.stdin, 1):
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                print(f"line {lineno}: expected 3 TSV columns, got {len(parts)} — skip", file=sys.stderr)
+                n_skip += 1
+                continue
+            src_tbl, src_id, text = parts
+            if len(text) < MIN_TEXT_LEN:
+                n_skip += 1
+                continue
+            try:
+                sid = int(src_id)
+                s.store_embedding(src_tbl, sid, text, _embed_text(text))
+                _store_preview(pdb, src_tbl, sid, text)
+                n_ok += 1
+                if n_ok % 25 == 0:
+                    print(f"  ... {n_ok} embedded", file=sys.stderr)
+            except Exception as exc:
+                print(f"line {lineno}: {exc}", file=sys.stderr)
+                n_skip += 1
+        print(f"batch done: {n_ok} embedded, {n_skip} skipped")
+        return 0
+    finally:
+        s.close()
+        pdb.close()
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    s = _store()
+    try:
+        rows = s._conn.execute(
+            "SELECT source_table, COUNT(*) AS n, MIN(ts_created) AS first, MAX(ts_created) AS last "
+            "FROM embeddings GROUP BY source_table ORDER BY n DESC"
+        ).fetchall()
+        if not rows:
+            print("(empty)")
+            return 0
+        print(f"{'source_table':<24}  {'count':>8}  first→last")
+        for r in rows:
+            import time
+
+            first = time.strftime("%Y-%m-%d", time.localtime(r["first"]))
+            last = time.strftime("%Y-%m-%d", time.localtime(r["last"]))
+            print(f"{r['source_table']:<24}  {r['n']:>8}  {first}  {last}")
+        return 0
+    finally:
+        s.close()
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    s = _store()
+    try:
+        q_bytes = _embed_text(args.text)
+        hits = s.find_by_vector(args.source_table, q_bytes, limit=args.limit)
+        for h in hits:
+            preview = _preview(s, args.source_table, h["source_id"])
+            print(f"{h['score']:.3f}  {args.source_table}:{h['source_id']}  {preview}")
+        return 0
+    finally:
+        s.close()
+
+
+def cmd_scan_all(args: argparse.Namespace) -> int:
+    """Idempotent scan-and-embed across all known high-signal sources.
+
+    Safe to run at session-start, session-end, or post-commit. Only embeds
+    rows/files whose (source_table, source_id) pair is absent from embeddings.
+    """
+    import hashlib
+    import re
+    import sqlite3
+    import time
+
+    def stable_id(s: str) -> int:
+        return int(hashlib.sha1(s.encode()).hexdigest()[:12], 16) & 0x7FFFFFFF
+
+    s = _store()
+    pdb = _preview_db()
+    cortex_conn = s._conn  # internal but acceptable for this tool
+    existing = set(
+        (r["source_table"], r["source_id"])
+        for r in cortex_conn.execute(
+            "SELECT source_table, source_id FROM embeddings"
+        ).fetchall()
+    )
+
+    n_total = 0
+    per_source = {}
+
+    def maybe_embed(source_table: str, source_id: int, text: str) -> bool:
+        if (source_table, source_id) in existing:
+            return False
+        if len(text) < MIN_TEXT_LEN:
+            return False
+        try:
+            s.store_embedding(source_table, source_id, text, _embed_text(text))
+            _store_preview(pdb, source_table, source_id, text)
+            existing.add((source_table, source_id))
+            return True
+        except Exception as exc:
+            print(f"  skip {source_table}:{source_id}: {exc}", file=sys.stderr)
+            return False
+
+    # 1. Events: breadcrumbs + dmn (source_table='events_curated')
+    rows = cortex_conn.execute(
+        "SELECT id, category, event_type, summary, detail FROM events "
+        "WHERE category IN ('breadcrumb', 'dmn')"
+    ).fetchall()
+    for r in rows:
+        text = " ".join([f"[{r['category']}/{r['event_type']}]", r["summary"] or "", r["detail"] or ""])
+        if maybe_embed("events_curated", r["id"], text):
+            per_source["events_curated"] = per_source.get("events_curated", 0) + 1
+            n_total += 1
+
+    # 2. Brain narratives — walkthrough, handoffs, decisions
+    brain = Path.home() / "Atrium" / "brain"
+    walk = brain / "walkthrough.md"
+    if walk.exists():
+        blocks = re.split(r"\n## ", walk.read_text())
+        for block in blocks[1:]:
+            header_line, _, body = block.partition("\n")
+            full = f"# {header_line}\n{body}"
+            sid = stable_id(f"walkthrough:{header_line}")
+            if maybe_embed("brain_walkthrough", sid, full):
+                per_source["brain_walkthrough"] = per_source.get("brain_walkthrough", 0) + 1
+                n_total += 1
+
+    for p in brain.glob("handoff*.md"):
+        sid = stable_id(f"handoff:{p.name}")
+        if maybe_embed("brain_handoff", sid, p.read_text()):
+            per_source["brain_handoff"] = per_source.get("brain_handoff", 0) + 1
+            n_total += 1
+
+    dec_dir = brain / "decisions"
+    if dec_dir.is_dir():
+        for p in dec_dir.glob("*.md"):
+            sid = stable_id(f"decision:{p.name}")
+            if maybe_embed("brain_decision", sid, p.read_text()):
+                per_source["brain_decision"] = per_source.get("brain_decision", 0) + 1
+                n_total += 1
+
+    # 3b. Vault session notes (A.3 migration — sessions source_table)
+    sessions_dir = SESSIONS_DIR
+    if sessions_dir.is_dir():
+        for p in sessions_dir.glob("*.md"):
+            try:
+                text = p.read_text(errors="replace")
+            except Exception:
+                continue
+            # Parse frontmatter for context enrichment
+            meta = {}
+            m = re.match(r"^---\n(.+?)\n---", text, re.DOTALL)
+            if m:
+                for line in m.group(1).split("\n"):
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip()
+            proj = meta.get("project", "")
+            date = meta.get("date", "")
+            state = meta.get("state", "")
+            # Truncate to ~2000 chars (MiniLM context budget). Session notes
+            # front-load context (frontmatter + intent + completed) and trail
+            # into reasoning traces + code dumps (lower signal).
+            body = text[:2000]
+            enriched = f"[session:{p.name}] [project:{proj}] [date:{date}] [state:{state}] {body}"
+            sid = stable_id(f"sessions:{p.name}")
+            if maybe_embed("sessions", sid, enriched):
+                per_source["sessions"] = per_source.get("sessions", 0) + 1
+                n_total += 1
+
+    # 3. Typed memories across all projects
+    projects = Path.home() / ".claude" / "projects"
+    if projects.is_dir():
+        for mem_dir in projects.glob("*/memory"):
+            if not mem_dir.is_dir():
+                continue
+            for p in mem_dir.glob("*.md"):
+                try:
+                    text = p.read_text(errors="replace")
+                except Exception:
+                    continue
+                project = mem_dir.parent.name.replace("-home-captain-", "").replace("-", "/")
+                enriched = f"[project:{project}] [file:{p.name}] {text}"
+                sid = stable_id(f"mem:{mem_dir.parent.name}:{p.name}")
+                if maybe_embed("claude_memory", sid, enriched):
+                    per_source["claude_memory"] = per_source.get("claude_memory", 0) + 1
+                    n_total += 1
+
+    # 4. Deep-dream digests (vault Insights/)
+    insights_dir = INSIGHTS_DIR
+    if insights_dir.is_dir():
+        for p in sorted(insights_dir.glob("*.md")):
+            try:
+                text = p.read_text(errors="replace")
+            except Exception:
+                continue
+            enriched = f"[insight:{p.stem}] {text[:2000]}"
+            sid = stable_id(f"insight:{p.name}")
+            if maybe_embed("vault_insights", sid, enriched):
+                per_source["vault_insights"] = per_source.get("vault_insights", 0) + 1
+                n_total += 1
+
+    # 5. Claudes_Mind — self-model + diary reflections (skip archive subdir, only top-level .md)
+    mind_dir = MIND_DIR
+    if mind_dir.is_dir():
+        for p in sorted(mind_dir.glob("*.md")):
+            try:
+                text = p.read_text(errors="replace")
+            except Exception:
+                continue
+            enriched = f"[mind:{p.stem}] {text[:2000]}"
+            sid = stable_id(f"mind:{p.name}")
+            if maybe_embed("vault_mind", sid, enriched):
+                per_source["vault_mind"] = per_source.get("vault_mind", 0) + 1
+                n_total += 1
+
+    # 6. Meridian graph community clusters (written by daemons/meridian-graph/build.py)
+    # Use community index (cid) as source_id — stable per community slot.
+    # To refresh after a graph rebuild: DELETE FROM embeddings WHERE source_table='meridian_community'
+    comm_file = Path.home() / ".graphify" / "meridian-memory" / "graphify-out" / "communities.jsonl"
+    if comm_file.exists():
+        import json as _json
+        for line in comm_file.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                c = _json.loads(line)
+            except Exception:
+                continue
+            cid = int(c.get("community", 0))
+            labels = ", ".join(c.get("labels", []))
+            tags = ", ".join(c.get("tags", []))
+            size = c.get("size", 0)
+            text = f"[meridian_community:{cid}] size:{size} nodes: {labels} tags: {tags}"
+            if maybe_embed("meridian_community", cid, text):
+                per_source["meridian_community"] = per_source.get("meridian_community", 0) + 1
+                n_total += 1
+
+    # 7. People — relationship memory (~/.claude/people/)
+    people_dir = Path.home() / ".claude" / "people"
+    if people_dir.is_dir():
+        for p in sorted(people_dir.glob("*.md")):
+            if p.name.startswith("_") or p.name.lower() == "readme.md":
+                continue
+            try:
+                text = p.read_text(errors="replace")
+            except Exception:
+                continue
+            meta = {}
+            m = re.match(r"^---\n(.+?)\n---", text, re.DOTALL)
+            if m:
+                for line in m.group(1).split("\n"):
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip()
+            person_name = meta.get("name", p.stem.replace("_", " "))
+            rtype = meta.get("relationship_type", "")
+            rstatus = meta.get("status", "")
+            enriched = (
+                f"[person:{person_name}] [type:{rtype}] [status:{rstatus}] "
+                f"[file:{p.name}] {text[:2000]}"
+            )
+            sid = stable_id(f"people:{p.name}")
+            if maybe_embed("people_context", sid, enriched):
+                per_source["people_context"] = per_source.get("people_context", 0) + 1
+                n_total += 1
+
+    print(f"scan-all: embedded {n_total} new entries")
+    for src, n in sorted(per_source.items()):
+        print(f"  {src}: {n}")
+    s.close()
+    pdb.close()
+    return 0
+
+
+def cmd_query_all(args: argparse.Namespace) -> int:
+    """Query every populated source_table and merge by score.
+
+    With --client (or auto when socket is live and --no-client not passed),
+    talks to atrium-embed-daemon for a warm <100ms path. Falls back to
+    in-process MiniLM load (~7s cold) otherwise.
+    """
+    use_client = getattr(args, "client", False) or (
+        DAEMON_SOCKET.exists() and not getattr(args, "no_client", False)
+    )
+    if use_client:
+        hits = _daemon_query_all(args.text, args.limit)
+        if hits is not None:
+            for h in hits[: args.limit]:
+                print(f"{h['score']:.3f}  {h['source_table']}:{h['source_id']}  {h.get('preview','')}")
+            return 0
+        if getattr(args, "client", False):
+            print("atrium-embed-source: --client requested but daemon unreachable", file=sys.stderr)
+            return 3
+        # auto-detected but failed — silently fall through to in-process path
+
+    s = _store()
+    try:
+        source_tables = [
+            r["source_table"]
+            for r in s._conn.execute(
+                "SELECT DISTINCT source_table FROM embeddings"
+            ).fetchall()
+        ]
+        if not source_tables:
+            print("(no embeddings)")
+            return 0
+        q_bytes = _embed_text(args.text)
+        all_hits = []
+        for src in source_tables:
+            for h in s.find_by_vector(src, q_bytes, limit=args.limit):
+                all_hits.append((h["score"], src, h["source_id"]))
+        all_hits.sort(key=lambda t: -t[0])
+        for score, src, sid in all_hits[: args.limit]:
+            preview = _preview(s, src, sid)
+            print(f"{score:.3f}  {src}:{sid}  {preview}")
+        return 0
+    finally:
+        s.close()
+
+
+def _preview(store, source_table: str, source_id: int) -> str:
+    """Best-effort one-line preview. Checks Atrium's preview DB first, then Cortex tables."""
+    try:
+        # 1. Preview sidecar (preferred — works for every source_table)
+        pdb = _preview_db()
+        try:
+            row = pdb.execute(
+                "SELECT preview_text FROM previews WHERE source_table=? AND source_id=?",
+                (source_table, source_id),
+            ).fetchone()
+            if row:
+                return row["preview_text"]
+        finally:
+            pdb.close()
+
+        # 2. Fallback to Cortex-native tables
+        if source_table == "solutions":
+            row = store._conn.execute(
+                "SELECT substr(problem, 1, 90) AS p FROM solutions WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            return row["p"] if row else ""
+        if source_table.startswith("events"):
+            row = store._conn.execute(
+                "SELECT substr(summary, 1, 90) AS p FROM events WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            return row["p"] if row else ""
+        if source_table == "sessions":
+            row = store._conn.execute(
+                "SELECT substr(summary, 1, 90) AS p FROM sessions WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            return row["p"] if row else ""
+        return ""
+    except Exception:
+        return ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="atrium-embed-source", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_store = sub.add_parser("store", help="embed one entry")
+    p_store.add_argument("source_table")
+    p_store.add_argument("source_id")
+    p_store.add_argument("text")
+    p_store.set_defaults(fn=cmd_store)
+
+    p_batch = sub.add_parser("batch", help="embed from stdin TSV")
+    p_batch.set_defaults(fn=cmd_batch)
+
+    p_cov = sub.add_parser("coverage", help="show embedding coverage by source_table")
+    p_cov.set_defaults(fn=cmd_coverage)
+
+    p_q = sub.add_parser("query", help="search one source_table")
+    p_q.add_argument("source_table")
+    p_q.add_argument("text")
+    p_q.add_argument("--limit", type=int, default=5)
+    p_q.set_defaults(fn=cmd_query)
+
+    p_qa = sub.add_parser("query-all", help="search across all source_tables")
+    p_qa.add_argument("text")
+    p_qa.add_argument("--limit", type=int, default=8)
+    p_qa.add_argument("--client", action="store_true",
+                      help="require daemon; fail if socket absent")
+    p_qa.add_argument("--no-client", action="store_true",
+                      help="skip daemon even if socket is live")
+    p_qa.set_defaults(fn=cmd_query_all)
+
+    p_scan = sub.add_parser("scan-all", help="idempotently embed new entries from all sources")
+    p_scan.set_defaults(fn=cmd_scan_all)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

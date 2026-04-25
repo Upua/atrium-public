@@ -1,0 +1,20 @@
+// ~/Atrium/zellij/themes/atrium.kdl
+// Atrium — oxidized copper. Coordinates with the ANSI 16 palette in kitty.conf.
+// Pane frames stay on (per agent-v0 layout); this theme tunes their colour.
+// Ported verbatim from ~/Atrium/design/IDENTITY.html § Zellij theme.
+
+themes {
+    atrium {
+        fg      "#e8dcc4"
+        bg      "#0f0c0a"
+        black   "#1a1410"
+        red     "#b85a3a"
+        green   "#8ca05a"
+        yellow  "#d89a4a"
+        blue    "#7a9ab0"
+        magenta "#b07a9a"
+        cyan    "#6aa090"
+        white   "#c9baa0"
+        orange  "#d87a4a"
+    }
+}

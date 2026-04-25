@@ -1,0 +1,7 @@
+/* Fonts: IBM Plex Mono as the closest-open-source stand-in for the
+ * brass-warm, slightly humanist mono we want (per IDENTITY.html § Type).
+ * Atrium itself runs FiraCode Nerd Font; for HTML derivatives we use
+ * IBM Plex Mono because it reads better on screen at 13px and has the
+ * same authored-warm feel we're aiming for.
+ */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&display=swap');

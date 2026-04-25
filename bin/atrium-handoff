@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# atrium-handoff — write brain/handoff.md so the next instance starts oriented.
+#
+# Usage:
+#   atrium-handoff write [--reason <string>]   # write handoff.md atomically
+#   atrium-handoff show                         # print current handoff
+#   atrium-handoff clear                        # move handoff.md to archive
+#
+# Content synthesized from:
+#   - brain/task.md (current top-level task)
+#   - brain/implementation_plan.md (active plan, checkboxes)
+#   - recent git log (last 5 commits + branch)
+#   - live peers (atrium-peer list)
+#   - last N trace events
+#   - today's cost + tokens
+#
+# "Write" is atomic (temp + rename). Previous handoff is archived to
+# brain/handoff-<timestamp>.md so we don't lose prior packets.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_handoff"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-handoff' is now a cognitive verb. Consider using 'atrium handoff' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+HANDOFF="$ATRIUM_ROOT/brain/handoff.md"
+BRAIN="$ATRIUM_ROOT/brain"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+cmd_write() {
+  local reason="manual"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      *) echo "unknown: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # Archive existing handoff (if any) before we overwrite
+  if [[ -f "$HANDOFF" ]]; then
+    mv "$HANDOFF" "$BRAIN/handoff-$(date +%Y%m%d-%H%M%S).md"
+  fi
+
+  local tmp
+  tmp="$(mktemp "$HANDOFF.XXXXXX")"
+
+  python3 - "$ATRIUM_ROOT" "$reason" <<'PY' >> "$tmp"
+import sys, os, json, subprocess, datetime
+from pathlib import Path
+from collections import Counter
+
+root = Path(sys.argv[1])
+reason = sys.argv[2]
+now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+def run(*args, cwd=None):
+    try:
+        return subprocess.check_output(list(args), cwd=cwd, text=True, stderr=subprocess.DEVNULL).rstrip()
+    except Exception: return ""
+
+def tail(p, n=20):
+    try:
+        with open(p) as f:
+            return f.readlines()[-n:]
+    except Exception: return []
+
+print(f"# Handoff Packet — {now}")
+print()
+print(f"**Reason:** {reason}")
+print(f"**Atrium root:** `{root}`")
+print()
+
+# ── Current task ─────────────────────────────────────────────
+task_md = root / "brain" / "task.md"
+if task_md.exists():
+    lines = task_md.read_text().splitlines()
+    summary = []
+    for ln in lines:
+        if ln.startswith("##"): continue
+        if ln.strip() and not ln.startswith("---"):
+            summary.append(ln)
+        if len(summary) >= 8: break
+    print("## Current task (from brain/task.md)")
+    print()
+    for ln in summary[:8]:
+        print(ln)
+    print()
+
+# ── Implementation plan: active phases ───────────────────────
+plan = root / "brain" / "implementation_plan.md"
+if plan.exists():
+    text = plan.read_text()
+    # Pull phases — lines starting with "### Phase "
+    phases = []
+    cur = None
+    for ln in text.splitlines():
+        if ln.startswith("### Phase"):
+            if cur: phases.append(cur)
+            cur = {"h": ln, "items": []}
+        elif cur and ln.startswith("- ["):
+            cur["items"].append(ln)
+    if cur: phases.append(cur)
+    done = [p for p in phases if all("[x]" in i for i in p["items"] if i.startswith("- ["))]
+    todo = [p for p in phases if p not in done]
+    print("## Implementation plan state")
+    print()
+    if done:
+        print(f"**Completed phases:** {len(done)} · {', '.join(p['h'].split('—')[0].strip('# ').strip() for p in done)}")
+    if todo:
+        print(f"**Open phases:** {len(todo)}")
+        for p in todo[:3]:
+            print(f"- {p['h'].strip('#').strip()}")
+            for item in p['items'][:5]:
+                print(f"  {item}")
+    print()
+
+# ── Recent commits ───────────────────────────────────────────
+branch = run("git", "-C", str(root), "branch", "--show-current")
+log = run("git", "-C", str(root), "log", "--oneline", "-10")
+print(f"## Git state")
+print()
+print(f"**Branch:** `{branch or 'main'}`")
+print()
+print("**Last 10 commits:**")
+print("```")
+print(log)
+print("```")
+print()
+
+# ── Live peers ───────────────────────────────────────────────
+peer_bin = str(root / "bin" / "atrium-peer")
+roster = run(peer_bin, "list")
+if roster:
+    print("## Live peers")
+    print()
+    print("```")
+    print(roster)
+    print("```")
+    print()
+
+# ── Cost + trace summary ─────────────────────────────────────
+trace_path = root / "state" / "trace.jsonl"
+if trace_path.exists():
+    today = datetime.date.today().isoformat()
+    total_cost = 0.0; day_cost = 0.0
+    kinds = Counter()
+    recent = []
+    with trace_path.open() as f:
+        for ln in f:
+            try: d = json.loads(ln)
+            except: continue
+            kinds[d.get("kind","?")] += 1
+            c = d.get("cost_usd")
+            if isinstance(c, (int, float)):
+                total_cost += c
+                if d.get("ts","").startswith(today): day_cost += c
+            recent.append(d)
+    recent = recent[-15:]
+    print("## Trace summary")
+    print()
+    print(f"- All-time cost: ${total_cost:.2f}")
+    print(f"- Today's cost: ${day_cost:.2f}")
+    print(f"- Events by kind (top 10): {', '.join(f'{k}={n}' for k,n in kinds.most_common(10))}")
+    print()
+    print("**Last 15 trace events (compact):**")
+    print("```")
+    for d in recent:
+        ts = d.get("ts","")[:19]
+        k  = d.get("kind","?")
+        extras = []
+        for key in ("tool","subject","to","sha","reason","path","cost_usd"):
+            v = d.get(key)
+            if v is not None: extras.append(f"{key}={v}")
+        print(f"{ts} {k:<18} {' '.join(extras)}")
+    print("```")
+    print()
+
+# ── What to do first (cold-start orientation) ────────────────
+print("## What to do first")
+print()
+print("Cold-start checklist for the next instance:")
+print("1. Read `~/Atrium/AGENTS.md` — identity + house rules")
+print("2. Read this file (handoff.md) in full")
+print("3. Read `brain/task.md` — current top-level goal")
+print("4. Check `brain/implementation_plan.md` for the next unchecked step")
+print("5. Run `atrium-peer list` — verify which subagents are still alive")
+print("6. Run `atrium-hud` — see current cost/burn state")
+print("7. Decide: resume the first unchecked plan item, or ask Niklas what changed")
+print()
+
+PY
+
+  mv "$tmp" "$HANDOFF"
+  "$TRACER" handoff_written reason="$reason" bytes="$(stat -c%s "$HANDOFF")" >/dev/null 2>&1 || true
+  echo "handoff written: $HANDOFF ($(stat -c%s "$HANDOFF") bytes)"
+}
+
+cmd_show() {
+  if [[ -f "$HANDOFF" ]]; then
+    cat "$HANDOFF"
+  else
+    echo "(no handoff yet — run: atrium-handoff write)"
+  fi
+}
+
+cmd_clear() {
+  if [[ -f "$HANDOFF" ]]; then
+    mv "$HANDOFF" "$BRAIN/handoff-$(date +%Y%m%d-%H%M%S).md"
+    echo "handoff archived"
+  else
+    echo "no handoff to clear"
+  fi
+}
+
+case "${1:-}" in
+  write)  shift; cmd_write "$@" ;;
+  show)   shift; cmd_show ;;
+  clear)  shift; cmd_clear ;;
+  ""|help|--help|-h) sed -n '2,15p' "$0" ;;
+  *) echo "atrium-handoff: unknown subcommand: ${1:-}" >&2; exit 2 ;;
+esac

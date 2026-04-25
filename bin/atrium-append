@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# atrium-append — appends content to end of file with atomicity + tracing.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_append"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-append' is now a cognitive verb. Consider using 'atrium append' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+GUARD="$ATRIUM_ROOT/bin/atrium-guard"
+
+if [[ $# -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
+  echo "Usage: atrium-append <absolute-path> [content]"
+  echo "       echo 'content' | atrium-append <absolute-path>"
+  exit 0
+fi
+
+TARGET="$1"
+shift
+
+if [[ "$TARGET" != /* ]]; then
+  echo "atrium-append: error: path must be absolute ($TARGET)" >&2
+  exit 1
+fi
+
+"$GUARD" check "atrium-append $TARGET"
+
+mkdir -p "$(dirname "$TARGET")"
+TMP="$(mktemp "${TARGET}.XXXXXX")"
+
+if [[ -f "$TARGET" ]]; then
+  cp "$TARGET" "$TMP"
+fi
+
+if [[ -s "$TMP" ]] && [[ "$(tail -c 1 "$TMP" | wc -l)" -eq 0 ]]; then
+  echo "" >> "$TMP"
+fi
+
+if [[ $# -gt 0 ]]; then
+  printf "%s\n" "$*" >> "$TMP"
+else
+  cat >> "$TMP"
+  if [[ -s "$TMP" ]] && [[ "$(tail -c 1 "$TMP" | wc -l)" -eq 0 ]]; then
+    echo "" >> "$TMP"
+  fi
+fi
+
+mv "$TMP" "$TARGET"
+
+BYTES=$(wc -c < "$TARGET")
+echo "appended: $TARGET (${BYTES}b)"
+"$TRACER" fs_append path="$TARGET" bytes="$BYTES"

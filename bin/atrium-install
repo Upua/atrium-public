@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# atrium-install — idempotent symlinker for Atrium primitives.
+#
+# Scans $ATRIUM_ROOT/bin/atrium-* and ensures each has a matching symlink in
+# $HOME/.local/bin/. Skips entries that already point to the right target;
+# repairs entries that point elsewhere (after confirm). Never touches
+# non-Atrium entries.
+#
+# Usage:
+#   atrium-install              # install missing links, skip existing-correct
+#   atrium-install --check      # dry-run: report what would change, no writes
+#   atrium-install --force      # repair broken/divergent links without prompt
+#
+# Solves the deploy gap where new primitives ship to ~/Atrium/bin/ but aren't
+# discoverable on PATH until manually symlinked. Run after adding a new
+# atrium-* script, or as part of session-begin.
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+SRC_DIR="$ATRIUM_ROOT/bin"
+DST_DIR="$HOME/.local/bin"
+TRACER="$SRC_DIR/atrium-trace"
+
+MODE="install"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check) MODE="check"; shift ;;
+    --force) MODE="force"; shift ;;
+    --help|-h) sed -n '2,16p' "$0"; exit 0 ;;
+    *) echo "atrium-install: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -d "$SRC_DIR" ]] || { echo "atrium-install: missing source dir: $SRC_DIR" >&2; exit 3; }
+mkdir -p "$DST_DIR"
+
+ADDED=0
+SKIPPED=0
+DIVERGENT=0
+REPAIRED=0
+
+for src in "$SRC_DIR"/atrium-*; do
+  [[ -f "$src" && -x "$src" ]] || continue
+  name="$(basename "$src")"
+  dst="$DST_DIR/$name"
+
+  if [[ -L "$dst" ]]; then
+    target="$(readlink "$dst")"
+    if [[ "$target" == "$src" ]]; then
+      SKIPPED=$((SKIPPED + 1))
+      continue
+    fi
+    DIVERGENT=$((DIVERGENT + 1))
+    case "$MODE" in
+      check) echo "DIVERGENT: $dst → $target (expected $src)" ;;
+      force) ln -sf "$src" "$dst"; REPAIRED=$((REPAIRED + 1)); echo "repaired: $name" ;;
+      install) echo "DIVERGENT (use --force to repair): $name → $target" >&2 ;;
+    esac
+  elif [[ -e "$dst" ]]; then
+    echo "skip (non-symlink exists): $dst" >&2
+  else
+    case "$MODE" in
+      check) echo "MISSING: $name" ;;
+      install|force) ln -s "$src" "$dst"; ADDED=$((ADDED + 1)); echo "linked: $name" ;;
+    esac
+  fi
+done
+
+echo "---"
+echo "added=$ADDED  skipped=$SKIPPED  divergent=$DIVERGENT  repaired=$REPAIRED  mode=$MODE"
+
+[[ "$MODE" == "check" ]] || "$TRACER" install added="$ADDED" repaired="$REPAIRED" >/dev/null 2>&1 || true

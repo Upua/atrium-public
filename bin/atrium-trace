@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# atrium-trace — append one event to state/trace.jsonl
+#
+# Usage:
+#   atrium-trace <kind> [key=value ...]
+#   atrium-trace kind=<kind> [key=value ...]   # kind can also be keyed
+#
+# Examples:
+#   atrium-trace session_start layout=agent-v0 attach=false
+#   atrium-trace cmd cmd="ls -la" ms=12 exit=0
+#   atrium-trace guard_block cmd="rm -rf /" reason=rm-rf-root
+#
+# Values are treated as strings unless they parse as JSON numbers/bools/null.
+# Append-only, atomic via `>>` on a single `jq`-built object.
+#
+# Schema: state/trace.schema.md
+
+set -euo pipefail
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+mkdir -p "$(dirname "$TRACE")"
+
+[[ $# -ge 1 ]] || { echo "atrium-trace: usage: atrium-trace <kind> [key=value ...]" >&2; exit 2; }
+
+# First arg can be bare <kind> (no '=') or kind=<kind>
+if [[ "$1" != *=* ]]; then
+  KIND="$1"
+  shift
+else
+  KIND=""  # will come from --kind= below
+fi
+
+# Build the JSON object via python3 (jq --arg doesn't do numeric coercion)
+python3 - "$KIND" "$@" <<'PY' >> "$TRACE"
+import sys, json, datetime
+
+kind = sys.argv[1]
+args = sys.argv[2:]
+
+event = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+if kind:
+    event["kind"] = kind
+
+for a in args:
+    if "=" not in a:
+        raise SystemExit(f"atrium-trace: bad arg (need key=value): {a!r}")
+    k, v = a.split("=", 1)
+    # Coerce numbers / bools / null
+    try:
+        event[k] = json.loads(v)
+    except ValueError:
+        event[k] = v
+
+if "kind" not in event:
+    raise SystemExit("atrium-trace: 'kind' is required (first bare arg or kind=<x>)")
+
+# One line, no trailing newline issues
+print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+PY

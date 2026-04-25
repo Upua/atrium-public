@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# atrium-guard — budget + blocked-command filter.
+#
+# Usage:
+#   atrium-guard check '<cmd>'     → exit 0 if allowed, non-zero + reason if blocked
+#   atrium-guard spent              → print today's spend (USD) from trace.jsonl
+#   atrium-guard budget             → print daily budget (USD) from state/budget.json
+#   atrium-guard set-budget <usd>   → set daily budget (writes state/budget.json atomically)
+#
+# Blocks: reads patterns from state/blocklist.txt (regex, one per line).
+# Budget: daily cap from state/budget.json { "daily_usd": N }. Default $10.
+#
+# Every block AND every over-budget denial logs to trace.jsonl.
+
+set -euo pipefail
+
+if [[ "${ATRIUM_DISPATCHED:-0}" -ne 1 ]]; then
+  # v0.7 Deprecation Nudge
+  NUDGE_FILE="${ATRIUM_ROOT:-$HOME/Atrium}/state/.nudge_v07_guard"
+  if [[ -z "${ATRIUM_DISPATCHED:-}" ]] && [[ ! -f "$NUDGE_FILE" ]]; then
+      echo "atrium note: 'atrium-guard' is now a cognitive verb. Consider using 'atrium guard' instead." >&2
+      touch "$NUDGE_FILE"
+  fi
+fi
+
+
+ATRIUM_ROOT="${ATRIUM_ROOT:-$HOME/Atrium}"
+TRACE="$ATRIUM_ROOT/state/trace.jsonl"
+BUDGET_FILE="$ATRIUM_ROOT/state/budget.json"
+BLOCKLIST="$ATRIUM_ROOT/state/blocklist.txt"
+TRACER="$ATRIUM_ROOT/bin/atrium-trace"
+
+# --- Ensure blocklist exists with sane defaults (SIGNAL-lessons-derived) ---
+if [[ ! -f "$BLOCKLIST" ]]; then
+  mkdir -p "$(dirname "$BLOCKLIST")"
+  cat > "$BLOCKLIST" <<'EOF'
+# atrium-guard blocklist — one regex per line, blank lines and # comments ignored.
+# Bash commands matching ANY of these are refused. Mirrors SIGNAL safety.py lessons.
+# Extend carefully; every entry is a hard rule.
+
+^\s*rm\s+-rf\s+/\s*$
+^\s*rm\s+-rf\s+/\*
+^\s*rm\s+-rf\s+(/|/home|/etc|/usr|/var|/boot|\$HOME)/?\s*$
+^\s*sudo\s+rm
+^\s*mkfs(\.|$)
+^\s*dd\s.*of=/dev/(sd|nvme|mmc)
+^\s*(fdisk|parted|cryptsetup|wipefs)\b
+^\s*>\s*/dev/(sda|nvme|mmc)
+^\s*:\(\)\s*\{.*:\|:.*\};
+^\s*chmod\s+-R\s+000\s+/
+^\s*chown\s+-R\s+.*\s+/(?!home)
+EOF
+fi
+
+# --- Ensure budget file exists with default ---
+if [[ ! -f "$BUDGET_FILE" ]]; then
+  mkdir -p "$(dirname "$BUDGET_FILE")"
+  echo '{"daily_usd": 10.0}' > "$BUDGET_FILE"
+fi
+
+# --- Helper: atomic write ---
+_atomic_write() {
+  local target="$1" tmp
+  tmp="$(mktemp "${target}.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$target"
+}
+
+# --- Helper: read daily budget (USD float) ---
+_daily_budget() {
+  python3 -c "import json,sys; print(json.load(open('$BUDGET_FILE'))['daily_usd'])"
+}
+
+# --- Helper: sum today's cost_usd from trace.jsonl ---
+_spend_today() {
+  [[ -f "$TRACE" ]] || { echo "0"; return; }
+  python3 - "$TRACE" <<'PY'
+import sys, json, datetime
+path = sys.argv[1]
+today = datetime.date.today().isoformat()
+total = 0.0
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        ts = e.get("ts", "")
+        if not ts.startswith(today):
+            continue
+        c = e.get("cost_usd")
+        if isinstance(c, (int, float)):
+            total += c
+print(f"{total:.4f}")
+PY
+}
+
+# --- Subcommand dispatch ---
+case "${1:-}" in
+  check)
+    shift
+    [[ $# -ge 1 ]] || { echo "atrium-guard check: need a command string" >&2; exit 2; }
+    CMD="$*"
+
+    # 1. Pattern match against blocklist
+    BLOCKED_PATTERN=$(python3 - "$BLOCKLIST" "$CMD" <<'PY'
+import sys, re
+block_file, cmd = sys.argv[1], sys.argv[2]
+with open(block_file) as f:
+    for ln in f:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"): continue
+        try:
+            if re.search(ln, cmd):
+                print(ln); sys.exit(0)
+        except re.error:
+            continue
+sys.exit(1)
+PY
+    ) && {
+      "$TRACER" guard_block cmd="$CMD" reason=pattern pattern="$BLOCKED_PATTERN" >/dev/null 2>&1 || true
+      echo "atrium-guard: BLOCKED — matched pattern: $BLOCKED_PATTERN" >&2
+      exit 10
+    }
+
+    # 2. Budget check — respects mode (advisory | enforce).
+    #    Advisory: log + warn on stderr, return 0 (allow).
+    #    Enforce:  log + block, return non-zero.
+    #    Destructive-pattern block (step 1 above) is always enforce.
+    MODE_FILE="$ATRIUM_ROOT/state/guard-mode.txt"
+    MODE="advisory"
+    [[ -f "$MODE_FILE" ]] && MODE=$(cat "$MODE_FILE" | tr -d '[:space:]')
+    SPENT=$(_spend_today)
+    BUDGET=$(_daily_budget)
+    if python3 -c "import sys; sys.exit(0 if float('$SPENT') >= float('$BUDGET') else 1)"; then
+      if [[ "$MODE" == "enforce" ]]; then
+        "$TRACER" guard_block cmd="$CMD" reason=budget mode=enforce spent="$SPENT" budget="$BUDGET" >/dev/null 2>&1 || true
+        echo "atrium-guard: BLOCKED [enforce] — daily budget exceeded (\$$SPENT / \$$BUDGET)" >&2
+        exit 11
+      else
+        "$TRACER" guard_warn cmd="$CMD" reason=budget mode=advisory spent="$SPENT" budget="$BUDGET" >/dev/null 2>&1 || true
+        echo "atrium-guard: advisory — over budget (\$$SPENT / \$$BUDGET); run 'atrium-guard mode enforce' to block" >&2
+        # fall through to allow
+      fi
+    fi
+
+    # 3. Allowed
+    "$TRACER" guard_allow cmd="$CMD" >/dev/null 2>&1 || true
+    echo "atrium-guard: ok [$CMD]"
+    exit 0
+    ;;
+
+  mode)
+    shift
+    MODE_FILE="$ATRIUM_ROOT/state/guard-mode.txt"
+    if [[ $# -eq 0 ]]; then
+      [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" || echo "advisory"
+    else
+      case "$1" in
+        advisory|enforce)
+          printf "%s\n" "$1" | _atomic_write "$MODE_FILE"
+          echo "atrium-guard mode: $1"
+          "$TRACER" guard_mode mode="$1" >/dev/null 2>&1 || true
+          ;;
+        *) echo "atrium-guard mode: must be 'advisory' or 'enforce'" >&2; exit 2 ;;
+      esac
+    fi
+    ;;
+
+  spent)
+    _spend_today
+    ;;
+
+  budget)
+    _daily_budget
+    ;;
+
+  set-budget)
+    [[ $# -eq 2 ]] || { echo "atrium-guard set-budget: need exactly one USD amount" >&2; exit 2; }
+    python3 -c "import json; print(json.dumps({'daily_usd': float('$2')}))" | _atomic_write "$BUDGET_FILE"
+    echo "daily budget set to \$$2"
+    ;;
+
+  ""|help|--help|-h)
+    sed -n '2,16p' "$0"
+    ;;
+
+  *)
+    echo "atrium-guard: unknown subcommand: ${1:-}" >&2
+    exit 2
+    ;;
+esac
