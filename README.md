@@ -54,7 +54,7 @@ Peers don't talk over an API. They write files. The orchestrator (a Claude sessi
 ## How to read this repo
 
 1. Start with [`AGENTS.md`](AGENTS.md), [`PRINCIPLES.md`](PRINCIPLES.md), [`PATTERNS.md`](PATTERNS.md) — the operating philosophy
-2. Then [`brain/idea-a0-embed-daemon.md`](brain/idea-a0-embed-daemon.md), [`brain/idea-b-dmn-peer.md`](brain/idea-b-dmn-peer.md), [`brain/idea-a4-recall-feedback.md`](brain/idea-a4-recall-feedback.md) — the load-bearing patterns
+2. Then [`brain/idea-a0-embed-daemon.md`](brain/idea-a0-embed-daemon.md) (persistent warm-MiniLM embed daemon over UNIX socket), [`brain/idea-b-dmn-peer.md`](brain/idea-b-dmn-peer.md) (Default Mode Network as a trajectory-advisor peer), [`brain/idea-a4-recall-feedback.md`](brain/idea-a4-recall-feedback.md) (recall-usefulness feedback loop) — the load-bearing patterns
 3. Then [`bin/`](bin/) — the actual cognitive verbs as shell scripts
 4. Then [`brain/GROWTH.md`](brain/GROWTH.md) — how it got here
 
@@ -77,6 +77,27 @@ Two pieces are present but not fully wired:
 
 - `atrium-notify --modality voice` is stubbed — it logs "voice route requested but not yet implemented" and exits 0. Voice wiring (Kokoro/voicemode RPC) is Phase 2.2b in the [ROADMAP](https://github.com/Upua/captain-meridian-stack-public/blob/main/ROADMAP.md).
 - The `state/`, `snapshots/`, and `peers/` runtime directories from the dev repo are intentionally NOT included — they hold ephemeral session state and would re-pollute on first run anyway.
+
+## Key Atrium verbs
+
+A reading-guide snapshot (2026-04-25) of the verbs reached for most often during a session. The full set (~35) lives in [`bin/`](bin/) — see `atrium-help` for the live index.
+
+| Command | What it does (from the script's own header) |
+|---|---|
+| `atrium-session-begin` | Single entry point that bootstraps an Atrium working session cleanly |
+| `atrium-recall` | Lexical + semantic search over Atrium's memory surfaces |
+| `atrium-embed-daemon` | Persistent Python process holding MiniLM warm; serves embeds over a UNIX socket |
+| `atrium-embed-source` | Store / query embeddings across registered memory surfaces |
+| `atrium-vault` | Browse and search the Obsidian vault from the terminal |
+| `atrium-decide` | Log a non-trivial decision in `brain/decisions/` |
+| `atrium-handoff` | Write `brain/handoff.md` so the next instance starts oriented |
+| `atrium-plan` | Plan-gated execution ritual — makes `brain/implementation_plan.md` checkboxes LIVE state |
+| `atrium-peer` | Flat-file peer coordination (heartbeat / outbox / status / identity) |
+| `atrium-trace` / `atrium-tail` | Append one event to `state/trace.jsonl` / pretty-print recent events |
+| `atrium-notify` | Unified operator notification primitive (urgency × modality routing) |
+| `atrium-help` | Print the live verb index |
+
+Verbs operate on flat files and small shared services. There is no central runtime; the verbs *are* the runtime.
 
 ## License
 
